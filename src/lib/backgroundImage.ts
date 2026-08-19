@@ -1,4 +1,5 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@/lib/platform";
 import type { ImportedBackgroundImage } from "./ipc-types";
 
 export async function importBackgroundImage(file: File): Promise<ImportedBackgroundImage> {

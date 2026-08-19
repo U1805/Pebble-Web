@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@/lib/platform";
+import { listen } from "@/lib/platform";
 import { parseMailtoUrl } from "@/features/compose/mailto";
 import i18n from "@/lib/i18n";
 import { isComposeDirty, useComposeStore, type ComposePrefill } from "@/stores/compose.store";

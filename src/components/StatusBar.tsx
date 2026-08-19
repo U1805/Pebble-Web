@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "@/lib/platform";
 import { AlertCircle, AppWindow, Clock, RefreshCw } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUIStore, type RealtimeStatus } from "../stores/ui.store";

@@ -51,7 +51,7 @@ const StarredView = lazy(loadStarredView);
 import { useTranslation } from "react-i18next";
 import i18next from "i18next";
 import { WifiOff } from "lucide-react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "@/lib/platform";
 import { useQueryClient } from "@tanstack/react-query";
 import { setNotificationsEnabled as setBackendNotificationsEnabled, syncTitlebarTheme } from "@/lib/api";
 
