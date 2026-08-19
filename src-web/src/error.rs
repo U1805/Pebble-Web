@@ -1,8 +1,10 @@
 use axum::{
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use pebble_core::PebbleError;
 use serde_json::json;
 
 /// 命令业务错误：code = 稳定机器码，message = 人读说明。
@@ -35,17 +37,58 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// 包装核心 crate 错误为统一的内部错误（不泄漏内部细节给远端）。阶段四命令迁移启用。
+    /// 核心 crate 错误 → 传输层错误。
+    /// Validation/Auth 类错误保留 message（前端需要具体原因），其余记日志并转 500。
+    pub fn from_pebble(err: PebbleError) -> Self {
+        match err {
+            PebbleError::Validation(msg) => {
+                ApiError::BadRequest(format!("INVALID_ARGUMENT: {msg}"))
+            }
+            PebbleError::Auth(msg) | PebbleError::OAuth(msg) => ApiError::Unauthorized(msg),
+            PebbleError::UnsupportedProvider(msg) => {
+                ApiError::BadRequest(format!("UNSUPPORTED_PROVIDER: {msg}"))
+            }
+            other => {
+                tracing::error!(%other, "core error");
+                ApiError::Internal(other.to_string())
+            }
+        }
+    }
+
+    /// 存储层错误便捷映射。
+    pub fn from_store(err: PebbleError) -> Self {
+        Self::from_pebble(err)
+    }
+
+    /// JSON 序列化错误。
+    pub fn from_serialize(err: serde_json::Error) -> Self {
+        ApiError::Internal(format!("serialization failed: {err}"))
+    }
+
+    /// 旧版本接口（对外保持兼容），等价于 from_pebble 内部错误路径。
     #[allow(dead_code)]
-    pub fn from_core(err: pebble_core::PebbleError) -> Self {
-        tracing::error!(%err, "core error");
-        ApiError::Internal("internal error".to_string())
+    pub fn from_core(err: PebbleError) -> Self {
+        Self::from_pebble(err)
     }
 }
 
 impl From<CommandError> for ApiError {
     fn from(e: CommandError) -> Self {
         ApiError::BadRequest(format!("{}: {}", e.code, e.message))
+    }
+}
+
+/// 命令模块 String 错误的统一收口（如 credentials 封装返回 String）。
+impl From<String> for ApiError {
+    fn from(msg: String) -> Self {
+        ApiError::Internal(msg)
+    }
+}
+
+/// 请求体不是合法 JSON/参数错误时统一走结构化 400，替代 axum 默认文本响应。
+impl From<JsonRejection> for ApiError {
+    fn from(e: JsonRejection) -> Self {
+        ApiError::BadRequest(e.body_text())
     }
 }
 

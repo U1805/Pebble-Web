@@ -3,54 +3,106 @@ use std::path::PathBuf;
 /// 服务配置，全部来自环境变量（与部署态 compose 变量名一致）。
 ///
 /// 环境变量命名是本项目的唯一事实来源，禁止再设同义别名。
-/// 部分字段供阶段四（auth/store）与阶段七（static）启用，暂未读取。
+/// 安全项（PEBBLE_PASSWORD / PEBBLE_JWT_SECRET）为必填并拒绝占位符，
+/// 与服务公开到网络的风险匹配（计划书 §68 安全边界）。
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Config {
-    /// 监听端口（PEBBLE_PORT，默认 8080）
     pub port: u16,
-    /// 数据目录（PEBBLE_DATA_DIR，容器内 /data 由 volume 挂载）
     pub data_dir: PathBuf,
-    /// Web 用户登录密码（PEBBLE_PASSWORD，argon2 校验，阶段四起生效）
-    pub password: Option<String>,
-    /// JWT 签名密钥（PEBBLE_JWT_SECRET，至少 32 字符，阶段四起生效）
-    pub jwt_secret: Option<String>,
-    /// 邮件同步间隔秒（PEBBLE_SYNC_INTERVAL，默认 300）
-    pub sync_interval: u64,
-    /// 凭据加密密钥（PEBBLE_ENCRYPTION_KEY，hex 32 字节，阶段四起生效）
-    pub encryption_key: Option<String>,
-    /// 前端静态目录（PEBBLE_STATIC_DIR，默认 dist；阶段七接入）
+    pub password_hash: String,
+    pub jwt_secret: String,
+    pub sync_interval_secs: u64,
     pub static_dir: PathBuf,
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        let data_dir = std::env::var("PEBBLE_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./data"));
-        let static_dir = std::env::var("PEBBLE_STATIC_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./dist"));
+    pub fn from_env() -> Result<Self, String> {
+        let password = std::env::var("PEBBLE_PASSWORD")
+            .map_err(|_| "PEBBLE_PASSWORD env var is required".to_string())?;
+        let jwt_secret = std::env::var("PEBBLE_JWT_SECRET")
+            .map_err(|_| "PEBBLE_JWT_SECRET env var is required".to_string())?;
 
-        let config = Config {
-            port: std::env::var("PEBBLE_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
-            data_dir,
-            password: std::env::var("PEBBLE_PASSWORD").ok(),
-            jwt_secret: std::env::var("PEBBLE_JWT_SECRET").ok(),
-            sync_interval: std::env::var("PEBBLE_SYNC_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-            encryption_key: std::env::var("PEBBLE_ENCRYPTION_KEY").ok(),
-            static_dir,
-        };
-
-        if config.jwt_secret.is_none() {
-            tracing::warn!("PEBBLE_JWT_SECRET 未设置：登录与命令鉴权将在后续阶段启用，当前仅健康检查可用");
+        if is_insecure_jwt_secret(&jwt_secret) {
+            return Err("PEBBLE_JWT_SECRET must be at least 32 chars and not a placeholder"
+                .to_string());
         }
-        config
+        if is_insecure_default_password(&password) {
+            return Err("PEBBLE_PASSWORD must be changed from the default value".to_string());
+        }
+
+        let port = std::env::var("PEBBLE_PORT")
+            .unwrap_or_else(|_| "8080".to_string())
+            .parse::<u16>()
+            .map_err(|e| format!("Invalid PEBBLE_PORT: {e}"))?;
+
+        let data_dir =
+            PathBuf::from(std::env::var("PEBBLE_DATA_DIR").unwrap_or_else(|_| "/data".to_string()));
+
+        let sync_interval_secs = std::env::var("PEBBLE_SYNC_INTERVAL")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse::<u64>()
+            .map_err(|e| format!("Invalid PEBBLE_SYNC_INTERVAL: {e}"))?;
+
+        let static_dir = PathBuf::from(
+            std::env::var("PEBBLE_STATIC_DIR").unwrap_or_else(|_| "./dist".to_string()),
+        );
+
+        let password_hash = crate::auth::hash_password(&password)
+            .map_err(|e| format!("Failed to hash password: {e}"))?;
+
+        Ok(Self {
+            port,
+            data_dir,
+            password_hash,
+            jwt_secret,
+            sync_interval_secs,
+            static_dir,
+        })
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir.join("pebble.db")
+    }
+
+    pub fn index_dir(&self) -> PathBuf {
+        self.data_dir.join("index")
+    }
+
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.data_dir.join("attachments")
+    }
+}
+
+fn is_insecure_default_password(password: &str) -> bool {
+    matches!(password.trim(), "changeme" | "your-password-here")
+}
+
+fn is_insecure_jwt_secret(secret: &str) -> bool {
+    let trimmed = secret.trim();
+    matches!(
+        trimmed,
+        "change-this-to-a-random-string"
+            | "generate-a-random-string-here"
+            | "your-random-secret-at-least-32-chars"
+    ) || trimmed.len() < 32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_insecure_default_password, is_insecure_jwt_secret};
+
+    #[test]
+    fn rejects_documented_placeholder_passwords() {
+        assert!(is_insecure_default_password("changeme"));
+        assert!(is_insecure_default_password("your-password-here"));
+        assert!(!is_insecure_default_password("correct horse battery staple"));
+    }
+
+    #[test]
+    fn rejects_placeholder_or_short_jwt_secrets() {
+        assert!(is_insecure_jwt_secret("change-this-to-a-random-string"));
+        assert!(is_insecure_jwt_secret("your-random-secret-at-least-32-chars"));
+        assert!(is_insecure_jwt_secret("short-secret"));
+        assert!(!is_insecure_jwt_secret("this-is-a-real-secret-with-32-plus-chars"));
     }
 }
