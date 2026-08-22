@@ -1,4 +1,4 @@
-use pebble_core::{Account, Folder, FolderRole, Message, PebbleError};
+use pebble_core::{Account, Folder, FolderRole, Message, PebbleError, ProviderType};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
@@ -12,15 +12,23 @@ mod event {
 
 /// 操作后广播（同通道由 ws.rs 推送给所有订阅连接）。
 fn emit(state: &AppStateRef, event_type: &str, payload: Value) {
-    let _ = state.ws_broadcast.send(
-        json!({ "type": event_type, "payload": payload }).to_string(),
-    );
+    let _ = state
+        .ws_broadcast
+        .send(json!({ "type": event_type, "payload": payload }).to_string());
 }
 
 /// 归档/移动/删除后：文件夹变化 + 队列变化通知。
 fn emit_folder_and_queue_changed(state: &AppStateRef, message_id: &str) {
-    emit(state, event::FOLDER_CHANGED, json!({ "message_id": message_id }));
+    emit(
+        state,
+        event::FOLDER_CHANGED,
+        json!({ "message_id": message_id }),
+    );
     emit(state, event::PENDING_OPS_CHANGED, json!({}));
+}
+
+fn should_queue_remote_mutation(provider: &ProviderType) -> bool {
+    !matches!(provider, ProviderType::Pop3)
 }
 
 /// 消息生命周期命令（本地即时提交 + 远端写回排队）。
@@ -69,33 +77,49 @@ fn find_folder_by_role(
 }
 
 /// 排队远端写回操作（外层 payload 与桌面端 queue_pending_remote_op_for_local_commit 一致）。
-fn queue_pending(
-    state: &AppStateRef,
+pub(crate) fn queue_pending_for_store(
+    store: &pebble_store::Store,
     msg: &Message,
     op_type: &str,
     inner_payload: Value,
 ) -> Result<(), PebbleError> {
+    // POP3 has no stable remote mutation model in the shared provider (UIDLs
+    // are read-only). Keep archive/delete/flag changes local and do not leave
+    // permanently failing operations in the retry queue.
+    if store
+        .get_account(&msg.account_id)?
+        .is_some_and(|account| !should_queue_remote_mutation(&account.provider))
+    {
+        tracing::debug!(account_id = %msg.account_id, op_type, "skipping remote POP3 mutation");
+        return Ok(());
+    }
     let payload = json!({
         "provider_account_id": msg.account_id,
         "remote_id": msg.remote_id,
         "op": op_type,
         "payload": inner_payload,
     });
-    let op_id = state.store.insert_pending_mail_op(
-        &msg.account_id,
-        &msg.id,
-        op_type,
-        &payload.to_string(),
-    )?;
+    let op_id =
+        store.insert_pending_mail_op(&msg.account_id, &msg.id, op_type, &payload.to_string())?;
     // 与桌面端离线分支一致：连接失败时标记 failed 待后台重试
-    state
-        .store
-        .mark_pending_mail_op_failed(&op_id, "queued for background sync")?;
+    store.mark_pending_mail_op_failed(&op_id, "queued for background sync")?;
     Ok(())
 }
 
+fn queue_pending(
+    state: &AppStateRef,
+    msg: &Message,
+    op_type: &str,
+    inner_payload: Value,
+) -> Result<(), PebbleError> {
+    queue_pending_for_store(&state.store, msg, op_type, inner_payload)
+}
+
 /// 批量重建搜索索引文档（与桌面端 refresh_search_documents 等价）。
-fn refresh_search_documents(state: &AppStateRef, ids: &[String]) -> Result<(), PebbleError> {
+pub(crate) fn refresh_search_documents(
+    state: &AppStateRef,
+    ids: &[String],
+) -> Result<(), PebbleError> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -150,7 +174,8 @@ async fn archive_or_unarchive(state: AppStateRef, message_id: String) -> Result<
         return Ok(json!({ "status": "unarchived" }));
     }
 
-    match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive).map_err(ApiError::from_pebble)?
+    match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive)
+        .map_err(ApiError::from_pebble)?
     {
         Some(archive_folder) => {
             state
@@ -225,14 +250,20 @@ async fn restore_message(state: AppStateRef, message_id: String) -> Result<Value
 async fn delete_message(state: AppStateRef, message_id: String) -> Result<Value, ApiError> {
     let (msg, _account, source_folder) =
         find_message_context(&state, &message_id).map_err(ApiError::from_pebble)?;
-    let is_permanent =
-        source_folder.role == Some(FolderRole::Trash) || find_folder_by_role(&state, &msg.account_id, FolderRole::Trash).map_err(ApiError::from_pebble)?.is_none();
+    let is_permanent = source_folder.role == Some(FolderRole::Trash)
+        || find_folder_by_role(&state, &msg.account_id, FolderRole::Trash)
+            .map_err(ApiError::from_pebble)?
+            .is_none();
 
     state
         .store
         .soft_delete_message(&message_id)
         .map_err(ApiError::from_store)?;
-    let op_type = if is_permanent { "delete_permanent" } else { "delete" };
+    let op_type = if is_permanent {
+        "delete_permanent"
+    } else {
+        "delete"
+    };
     queue_pending(
         &state,
         &msg,
@@ -265,7 +296,9 @@ async fn move_to_folder(
         .map_err(ApiError::from_store)?
         .into_iter()
         .find(|f| f.id == target_folder_id)
-        .ok_or_else(|| ApiError::BadRequest(format!("target folder not found: {target_folder_id}")))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("target folder not found: {target_folder_id}"))
+        })?;
 
     state
         .store
@@ -299,7 +332,10 @@ async fn empty_trash(state: AppStateRef, account_id: String) -> Result<Value, Ap
     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
     let count = ids.len() as u32;
     if !ids.is_empty() {
-        state.store.hard_delete_messages(&ids).map_err(ApiError::from_store)?;
+        state
+            .store
+            .hard_delete_messages(&ids)
+            .map_err(ApiError::from_store)?;
     }
     for msg in &messages {
         queue_pending(
@@ -325,13 +361,19 @@ async fn update_message_flags(
         .map_err(ApiError::from_store)?
         .is_some();
     if !exists {
-        return Err(ApiError::NotFound(format!("message not found: {message_id}")));
+        return Err(ApiError::NotFound(format!(
+            "message not found: {message_id}"
+        )));
     }
     state
         .store
         .update_message_flags(&message_id, is_read, is_starred)
         .map_err(ApiError::from_store)?;
-    if let Some(msg) = state.store.get_message(&message_id).map_err(ApiError::from_store)? {
+    if let Some(msg) = state
+        .store
+        .get_message(&message_id)
+        .map_err(ApiError::from_store)?
+    {
         queue_pending(
             &state,
             &msg,
@@ -348,10 +390,14 @@ async fn batch_archive(state: AppStateRef, message_ids: Vec<String>) -> Result<V
     let mut archived = 0u32;
     for id in &message_ids {
         if let Ok((msg, _account, source_folder)) = find_message_context(&state, id) {
-            match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive).map_err(ApiError::from_pebble)?
+            match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive)
+                .map_err(ApiError::from_pebble)?
             {
                 Some(af) => {
-                    state.store.move_message_to_folder(id, &af.id).map_err(ApiError::from_store)?;
+                    state
+                        .store
+                        .move_message_to_folder(id, &af.id)
+                        .map_err(ApiError::from_store)?;
                     queue_pending(
                         &state,
                         &msg,
@@ -366,7 +412,10 @@ async fn batch_archive(state: AppStateRef, message_ids: Vec<String>) -> Result<V
                     .map_err(ApiError::from_pebble)?;
                 }
                 None => {
-                    state.store.soft_delete_message(id).map_err(ApiError::from_store)?;
+                    state
+                        .store
+                        .soft_delete_message(id)
+                        .map_err(ApiError::from_store)?;
                     queue_pending(
                         &state,
                         &msg,
@@ -414,10 +463,26 @@ async fn batch_mark_read(
     message_ids: Vec<String>,
     is_read: bool,
 ) -> Result<Value, ApiError> {
-    let changes: Vec<(String, Option<bool>, Option<bool>)> =
-        message_ids.iter().map(|id| (id.clone(), Some(is_read), None)).collect();
-    state.store.bulk_update_flags(&changes).map_err(ApiError::from_store)?;
-    for id in &message_ids {
+    let existing_ids: Vec<String> = message_ids
+        .iter()
+        .filter_map(|id| match state.store.get_message(id) {
+            Ok(Some(_)) => Some(Ok(id.clone())),
+            Ok(None) => None,
+            Err(error) => Some(Err(ApiError::from_store(error))),
+        })
+        .collect::<Result<_, _>>()?;
+    if existing_ids.is_empty() {
+        return Ok(json!(0u32));
+    }
+    let changes: Vec<(String, Option<bool>, Option<bool>)> = existing_ids
+        .iter()
+        .map(|id| (id.clone(), Some(is_read), None))
+        .collect();
+    state
+        .store
+        .bulk_update_flags(&changes)
+        .map_err(ApiError::from_store)?;
+    for id in &existing_ids {
         if let Ok(msg) = state.store.get_message(id) {
             if let Some(msg) = msg {
                 queue_pending(&state, &msg, "update_flags", json!({ "is_read": is_read }))
@@ -425,26 +490,42 @@ async fn batch_mark_read(
             }
         }
     }
-    refresh_search_documents(&state, &message_ids).map_err(ApiError::from_pebble)?;
-    Ok(Value::Null)
+    refresh_search_documents(&state, &existing_ids).map_err(ApiError::from_pebble)?;
+    Ok(json!(existing_ids.len() as u32))
 }
 
 async fn batch_star(
     state: AppStateRef,
     message_ids: Vec<String>,
-    is_starred: bool,
+    starred: bool,
 ) -> Result<Value, ApiError> {
-    let changes: Vec<(String, Option<bool>, Option<bool>)> =
-        message_ids.iter().map(|id| (id.clone(), None, Some(is_starred))).collect();
-    state.store.bulk_update_flags(&changes).map_err(ApiError::from_store)?;
-    for id in &message_ids {
+    let existing_ids: Vec<String> = message_ids
+        .iter()
+        .filter_map(|id| match state.store.get_message(id) {
+            Ok(Some(_)) => Some(Ok(id.clone())),
+            Ok(None) => None,
+            Err(error) => Some(Err(ApiError::from_store(error))),
+        })
+        .collect::<Result<_, _>>()?;
+    if existing_ids.is_empty() {
+        return Ok(json!(0u32));
+    }
+    let changes: Vec<(String, Option<bool>, Option<bool>)> = existing_ids
+        .iter()
+        .map(|id| (id.clone(), None, Some(starred)))
+        .collect();
+    state
+        .store
+        .bulk_update_flags(&changes)
+        .map_err(ApiError::from_store)?;
+    for id in &existing_ids {
         if let Ok(Some(msg)) = state.store.get_message(id) {
-            queue_pending(&state, &msg, "update_flags", json!({ "is_starred": is_starred }))
+            queue_pending(&state, &msg, "update_flags", json!({"starred": starred}))
                 .map_err(ApiError::from_pebble)?;
         }
     }
-    refresh_search_documents(&state, &message_ids).map_err(ApiError::from_pebble)?;
-    Ok(Value::Null)
+    refresh_search_documents(&state, &existing_ids).map_err(ApiError::from_pebble)?;
+    Ok(json!(existing_ids.len() as u32))
 }
 
 /// 命令分发入口（参数从 JSON 反序列化）。
@@ -455,16 +536,28 @@ pub async fn dispatch_command(
 ) -> Result<Value, ApiError> {
     match command {
         "archive_message" => {
-            let id: String = serde_json::from_value(args).map_err(invalid_args("archive_message"))?;
-            archive_or_unarchive(state, id).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                message_id: String,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("archive_message"))?;
+            archive_or_unarchive(state, a.message_id).await
         }
         "restore_message" => {
-            let id: String = serde_json::from_value(args).map_err(invalid_args("restore_message"))?;
-            restore_message(state, id).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                message_id: String,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("restore_message"))?;
+            restore_message(state, a.message_id).await
         }
         "delete_message" => {
-            let id: String = serde_json::from_value(args).map_err(invalid_args("delete_message"))?;
-            delete_message(state, id).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                message_id: String,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("delete_message"))?;
+            delete_message(state, a.message_id).await
         }
         "move_to_folder" => {
             #[derive(serde::Deserialize)]
@@ -476,8 +569,12 @@ pub async fn dispatch_command(
             move_to_folder(state, a.message_id, a.target_folder_id).await
         }
         "empty_trash" => {
-            let account_id: String = serde_json::from_value(args).map_err(invalid_args("empty_trash"))?;
-            empty_trash(state, account_id).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                account_id: String,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("empty_trash"))?;
+            empty_trash(state, a.account_id).await
         }
         "update_message_flags" => {
             #[derive(serde::Deserialize)]
@@ -488,16 +585,25 @@ pub async fn dispatch_command(
                 #[serde(default)]
                 is_starred: Option<bool>,
             }
-            let a: Args = serde_json::from_value(args).map_err(invalid_args("update_message_flags"))?;
+            let a: Args =
+                serde_json::from_value(args).map_err(invalid_args("update_message_flags"))?;
             update_message_flags(state, a.message_id, a.is_read, a.is_starred).await
         }
         "batch_archive" => {
-            let ids: Vec<String> = serde_json::from_value(args).map_err(invalid_args("batch_archive"))?;
-            batch_archive(state, ids).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                message_ids: Vec<String>,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("batch_archive"))?;
+            batch_archive(state, a.message_ids).await
         }
         "batch_delete" => {
-            let ids: Vec<String> = serde_json::from_value(args).map_err(invalid_args("batch_delete"))?;
-            batch_delete(state, ids).await
+            #[derive(serde::Deserialize)]
+            struct Args {
+                message_ids: Vec<String>,
+            }
+            let a: Args = serde_json::from_value(args).map_err(invalid_args("batch_delete"))?;
+            batch_delete(state, a.message_ids).await
         }
         "batch_mark_read" => {
             #[derive(serde::Deserialize)]
@@ -509,13 +615,14 @@ pub async fn dispatch_command(
             batch_mark_read(state, a.message_ids, a.is_read).await
         }
         "batch_star" => {
+            // 与上游 Tauri 命令签名一致：batch_star(message_ids, starred)
             #[derive(serde::Deserialize)]
             struct Args {
                 message_ids: Vec<String>,
-                is_starred: bool,
+                starred: bool,
             }
             let a: Args = serde_json::from_value(args).map_err(invalid_args("batch_star"))?;
-            batch_star(state, a.message_ids, a.is_starred).await
+            batch_star(state, a.message_ids, a.starred).await
         }
         _ => Err(ApiError::NotFound(format!("unknown command: {command}"))),
     }
@@ -523,4 +630,160 @@ pub async fn dispatch_command(
 
 fn invalid_args(command: &'static str) -> impl FnOnce(serde_json::Error) -> ApiError + 'static {
     move |e| ApiError::BadRequest(format!("invalid {command} args: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        archive_or_unarchive, delete_message, restore_message, should_queue_remote_mutation,
+    };
+    use crate::config::Config;
+    use crate::state::{AppState, AppStateRef};
+    use pebble_core::{
+        now_timestamp, Account, Folder, FolderRole, FolderType, Message, ProviderType,
+    };
+    use std::path::PathBuf;
+
+    fn test_state() -> AppStateRef {
+        let data_dir = std::env::temp_dir().join(format!("pw-lifecycle-{}", uuid::Uuid::new_v4()));
+        AppState::init(Config {
+            port: 0,
+            data_dir,
+            password_hash: "unused-in-unit-test".to_string(),
+            jwt_secret: "this-is-a-real-secret-with-32-plus-chars".to_string(),
+            sync_interval_secs: 3600,
+            static_dir: PathBuf::from("./dist"),
+        })
+        .unwrap()
+    }
+
+    fn seed_message(state: &AppStateRef) -> (Message, Folder, Folder, Folder) {
+        let now = now_timestamp();
+        let account = Account {
+            id: "lifecycle-account".to_string(),
+            email: "owner@example.com".to_string(),
+            display_name: "Owner".to_string(),
+            color: None,
+            provider: ProviderType::Imap,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.insert_account(&account).unwrap();
+
+        let folder = |id: &str, name: &str, remote_id: &str, role: FolderRole, sort_order| Folder {
+            id: id.to_string(),
+            account_id: account.id.clone(),
+            remote_id: remote_id.to_string(),
+            name: name.to_string(),
+            folder_type: FolderType::Folder,
+            role: Some(role),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order,
+        };
+        let inbox = folder("lifecycle-inbox", "Inbox", "INBOX", FolderRole::Inbox, 0);
+        let archive = folder(
+            "lifecycle-archive",
+            "Archive",
+            "Archive",
+            FolderRole::Archive,
+            1,
+        );
+        let trash = folder("lifecycle-trash", "Trash", "Trash", FolderRole::Trash, 2);
+        for item in [&inbox, &archive, &trash] {
+            state.store.insert_folder(item).unwrap();
+        }
+
+        let message = Message {
+            id: "lifecycle-message".to_string(),
+            account_id: account.id,
+            remote_id: "remote-lifecycle-message".to_string(),
+            message_id_header: Some("<lifecycle@example.com>".to_string()),
+            in_reply_to: None,
+            references_header: None,
+            thread_id: None,
+            subject: "Lifecycle".to_string(),
+            snippet: "Lifecycle".to_string(),
+            from_address: "sender@example.com".to_string(),
+            from_name: "Sender".to_string(),
+            to_list: vec![],
+            cc_list: vec![],
+            bcc_list: vec![],
+            body_text: "body".to_string(),
+            body_html_raw: String::new(),
+            has_attachments: false,
+            is_read: false,
+            is_starred: false,
+            is_draft: false,
+            date: now,
+            remote_version: None,
+            is_deleted: false,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state
+            .store
+            .insert_message(&message, std::slice::from_ref(&inbox.id))
+            .unwrap();
+        (message, inbox, archive, trash)
+    }
+
+    #[test]
+    fn pop3_mutations_are_local_only() {
+        assert!(!should_queue_remote_mutation(&ProviderType::Pop3));
+        assert!(should_queue_remote_mutation(&ProviderType::Imap));
+        assert!(should_queue_remote_mutation(&ProviderType::Gmail));
+        assert!(should_queue_remote_mutation(&ProviderType::Outlook));
+    }
+
+    #[tokio::test]
+    async fn archive_delete_and_restore_update_local_state() {
+        let state = test_state();
+        let (message, inbox, archive, _trash) = seed_message(&state);
+
+        let archived = archive_or_unarchive(state.clone(), message.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(archived["status"], "archived");
+        assert_eq!(
+            state.store.get_message_folder_ids(&message.id).unwrap(),
+            vec![archive.id.clone()]
+        );
+        assert_eq!(state.search.search("Lifecycle", 10).unwrap().len(), 1);
+
+        let unarchived = archive_or_unarchive(state.clone(), message.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(unarchived["status"], "unarchived");
+        assert_eq!(
+            state.store.get_message_folder_ids(&message.id).unwrap(),
+            vec![inbox.id.clone()]
+        );
+
+        delete_message(state.clone(), message.id.clone())
+            .await
+            .unwrap();
+        assert!(
+            state
+                .store
+                .get_message(&message.id)
+                .unwrap()
+                .unwrap()
+                .is_deleted
+        );
+        assert!(state.search.search("Lifecycle", 10).unwrap().is_empty());
+
+        restore_message(state.clone(), message.id.clone())
+            .await
+            .unwrap();
+        let restored = state.store.get_message(&message.id).unwrap().unwrap();
+        assert!(!restored.is_deleted);
+        assert_eq!(
+            state.store.get_message_folder_ids(&message.id).unwrap(),
+            vec![inbox.id]
+        );
+        assert_eq!(state.search.search("Lifecycle", 10).unwrap().len(), 1);
+    }
 }

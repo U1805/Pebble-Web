@@ -42,7 +42,8 @@ pub async fn create_rule(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 }
 
 pub async fn update_rule(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let rule: Rule = serde_json::from_value(args)
+    // 与上游 Tauri 命令签名一致：前端 invoke 传 { rule: Rule }
+    let rule: Rule = serde_json::from_value(args.get("rule").cloned().unwrap_or(Value::Null))
         .map_err(|e| ApiError::BadRequest(format!("invalid update_rule args: {e}")))?;
     let store = state.store.clone();
     run_blocking(move || store.update_rule(&rule)).await?;

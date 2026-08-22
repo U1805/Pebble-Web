@@ -41,8 +41,10 @@ pub async fn get_contact_by_email(state: AppStateRef, args: Value) -> Result<Val
 }
 
 pub async fn save_contact(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let input: ContactInput = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid save_contact args: {e}")))?;
+    // 与上游 Tauri 命令签名一致：前端 invoke 传 { input: ContactInput }
+    let input: ContactInput =
+        serde_json::from_value(args.get("input").cloned().unwrap_or(Value::Null))
+            .map_err(|e| ApiError::BadRequest(format!("invalid save_contact args: {e}")))?;
     let store = state.store.clone();
     let contact = run_blocking(move || store.save_contact(&input)).await?;
     serde_json::to_value(contact).map_err(ApiError::from_serialize)
@@ -59,7 +61,9 @@ pub async fn delete_contact(state: AppStateRef, args: Value) -> Result<Value, Ap
         .map_err(|e| ApiError::BadRequest(format!("invalid delete_contact args: {e}")))?;
     let contact_id = args.contact_id.trim().to_string();
     if contact_id.is_empty() {
-        return Err(ApiError::BadRequest("contact id must not be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "contact id must not be empty".to_string(),
+        ));
     }
     let store = state.store.clone();
     run_blocking(move || {
@@ -79,14 +83,19 @@ pub async fn set_contact_favorite(state: AppStateRef, args: Value) -> Result<Val
         .map_err(|e| ApiError::BadRequest(format!("invalid set_contact_favorite args: {e}")))?;
     let contact_id = args.contact_id.trim().to_string();
     if contact_id.is_empty() {
-        return Err(ApiError::BadRequest("contact id must not be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "contact id must not be empty".to_string(),
+        ));
     }
     let store = state.store.clone();
     run_blocking(move || store.set_contact_favorite(&contact_id, args.is_favorite)).await?;
     Ok(Value::Null)
 }
 
-pub async fn search_contact_suggestions(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+pub async fn search_contact_suggestions(
+    state: AppStateRef,
+    args: Value,
+) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
     struct Args {
         account_id: String,
@@ -105,9 +114,13 @@ pub async fn search_contact_suggestions(state: AppStateRef, args: Value) -> Resu
     serde_json::to_value(suggestions).map_err(ApiError::from_serialize)
 }
 
-pub async fn suppress_contact_suggestion(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let address: String = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid suppress_contact_suggestion args: {e}")))?;
+pub async fn suppress_contact_suggestion(
+    state: AppStateRef,
+    args: Value,
+) -> Result<Value, ApiError> {
+    let address: String = serde_json::from_value(args).map_err(|e| {
+        ApiError::BadRequest(format!("invalid suppress_contact_suggestion args: {e}"))
+    })?;
     let store = state.store.clone();
     run_blocking(move || store.suppress_contact_suggestion(&address)).await?;
     Ok(Value::Null)

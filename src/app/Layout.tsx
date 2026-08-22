@@ -22,6 +22,7 @@ import { useNotificationOpenNavigation } from "./useNotificationOpenNavigation";
 import { useCloseToBackground } from "./useCloseToBackground";
 import { useTrayI18n } from "./useTrayI18n";
 import { useMailtoOpen } from "./useMailtoOpen";
+import { useWebNotifications } from "./useWebNotifications";
 import AppBackground from "./AppBackground";
 
 const loadSettingsView = () => import("../features/settings/SettingsView");
@@ -80,6 +81,7 @@ export default function Layout() {
   useRealtimeSyncTriggers();
   useNotificationOpenNavigation();
   useCloseToBackground();
+  useWebNotifications();
   useTrayI18n();
   useMailtoOpen();
 

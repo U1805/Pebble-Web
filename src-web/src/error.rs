@@ -78,6 +78,13 @@ impl From<CommandError> for ApiError {
     }
 }
 
+/// 核心 crate 错误的一站式转换（命令层 `?` 直接可用）。
+impl From<PebbleError> for ApiError {
+    fn from(err: PebbleError) -> Self {
+        ApiError::from_pebble(err)
+    }
+}
+
 /// 命令模块 String 错误的统一收口（如 credentials 封装返回 String）。
 impl From<String> for ApiError {
     fn from(msg: String) -> Self {

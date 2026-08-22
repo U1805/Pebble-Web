@@ -71,6 +71,11 @@ impl Config {
     pub fn attachments_dir(&self) -> PathBuf {
         self.data_dir.join("attachments")
     }
+
+    /// 服务日志文件路径（read_app_log 读取；logs/ 目录内）。
+    pub fn log_path(&self) -> PathBuf {
+        self.data_dir.join("logs").join("pebble-web.log")
+    }
 }
 
 fn is_insecure_default_password(password: &str) -> bool {

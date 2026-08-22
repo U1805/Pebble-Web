@@ -1,9 +1,10 @@
 use pebble_crypto::CryptoService;
-use pebble_store::Store;
 use pebble_search::TantivySearch;
+use pebble_store::Store;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;
 use crate::crypto;
@@ -22,6 +23,9 @@ pub struct AppState {
     pub attachments_dir: PathBuf,
     pub sync_manager: Arc<SyncManager>,
     pub ws_broadcast: broadcast::Sender<String>,
+    /// Server-side OAuth transactions. The PKCE verifier and form data never
+    /// leave the service or live in browser-controlled storage.
+    pub(crate) oauth_pending: Arc<Mutex<HashMap<String, crate::oauth::PendingOAuth>>>,
 }
 
 pub type AppStateRef = Arc<AppState>;
@@ -33,8 +37,8 @@ impl AppState {
         std::fs::create_dir_all(config.attachments_dir())
             .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
 
-        let store = Store::open(&config.db_path())
-            .map_err(|e| format!("Failed to open store: {e}"))?;
+        let store =
+            Store::open(&config.db_path()).map_err(|e| format!("Failed to open store: {e}"))?;
         let search = TantivySearch::open(&config.index_dir())
             .map_err(|e| format!("Failed to open search index: {e}"))?;
         let crypto = crypto::load_or_create_crypto(&config.data_dir)
@@ -57,6 +61,7 @@ impl AppState {
             sync_interval,
             ws_broadcast.clone(),
         ));
+        let oauth_pending = Arc::new(Mutex::new(HashMap::new()));
 
         Ok(Arc::new(Self {
             config,
@@ -66,6 +71,7 @@ impl AppState {
             attachments_dir,
             sync_manager,
             ws_broadcast,
+            oauth_pending,
         }))
     }
 }

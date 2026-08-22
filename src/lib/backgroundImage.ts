@@ -1,5 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { invoke } from "@/lib/platform";
+import { invoke, platform } from "@/lib/platform";
 import type { ImportedBackgroundImage } from "./ipc-types";
 
 export async function importBackgroundImage(file: File): Promise<ImportedBackgroundImage> {
@@ -15,6 +15,7 @@ export async function deleteBackgroundImage(path: string): Promise<void> {
 }
 
 export function backgroundImageUrl(path: string): string {
+  if (platform === "web") return path;
   try {
     return convertFileSrc(path);
   } catch {

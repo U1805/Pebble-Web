@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   cancelCloseCompose: vi.fn(),
   showComposeLeaveConfirm: false,
   quotedReplyHtml: "",
+  composeMode: "new",
+  composeReplyTo: null as any,
   accountsQuery: {
     data: [{ id: "account-1", email: "me@example.com", display_name: "Me" }],
     isLoading: false,
@@ -51,8 +53,8 @@ vi.mock("../../../src/stores/compose.store", () => ({
       cancelCloseCompose: () => void;
     }) => unknown) =>
       selector({
-        composeMode: "new",
-        composeReplyTo: null,
+        composeMode: mocks.composeMode,
+        composeReplyTo: mocks.composeReplyTo,
         closeCompose: mocks.closeCompose,
         showComposeLeaveConfirm: mocks.showComposeLeaveConfirm,
         confirmCloseCompose: mocks.confirmCloseCompose,
@@ -221,6 +223,8 @@ describe("ComposeView", () => {
     mocks.cancelCloseCompose.mockReset();
     mocks.showComposeLeaveConfirm = false;
     mocks.quotedReplyHtml = "";
+    mocks.composeMode = "new";
+    mocks.composeReplyTo = null;
     mocks.accountsQuery.data = [{ id: "account-1", email: "me@example.com", display_name: "Me" }];
     mocks.accountsQuery.isLoading = false;
     mocks.accountsQuery.isSuccess = true;
@@ -305,6 +309,86 @@ describe("ComposeView", () => {
 
     await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
       expect.objectContaining({ to: ["typed@example.com"] }),
+      expect.any(Object),
+    ));
+  });
+
+  it("keeps ordinary sends free of reply headers", async () => {
+    render(<ComposeView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: "",
+        inReplyTo: undefined,
+      }),
+      expect.any(Object),
+    ));
+  });
+
+  it("sends reply mode with the original Message-ID and normalized subject", async () => {
+    mocks.composeMode = "reply";
+    mocks.composeReplyTo = {
+      subject: "Re: Original subject",
+      message_id_header: "<original@example.com>",
+    };
+
+    render(<ComposeView />);
+
+    expect((screen.getByLabelText("Subject") as HTMLInputElement).value).toBe("Re: Original subject");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: "Re: Original subject",
+        inReplyTo: "<original@example.com>",
+      }),
+      expect.any(Object),
+    ));
+  });
+
+  it("keeps reply-all recipients and the original Message-ID", async () => {
+    mocks.composeMode = "reply-all";
+    mocks.composeReplyTo = {
+      subject: "Team update",
+      message_id_header: "<team@example.com>",
+    };
+    mocks.recipients.to = ["sender@example.com", "peer@example.com"];
+    mocks.recipients.cc = ["team@example.com"];
+
+    render(<ComposeView />);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: ["sender@example.com", "peer@example.com"],
+        cc: ["team@example.com"],
+        subject: "Re: Team update",
+        inReplyTo: "<team@example.com>",
+      }),
+      expect.any(Object),
+    ));
+  });
+
+  it("sends forward mode without an in-reply-to header", async () => {
+    mocks.composeMode = "forward";
+    mocks.composeReplyTo = {
+      subject: "Original message",
+      message_id_header: "<original@example.com>",
+    };
+    mocks.recipients.to = ["forward@example.com"];
+
+    render(<ComposeView />);
+    expect((screen.getByLabelText("Subject") as HTMLInputElement).value).toBe("Fwd: Original message");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: ["forward@example.com"],
+        subject: "Fwd: Original message",
+        inReplyTo: undefined,
+      }),
       expect.any(Object),
     ));
   });

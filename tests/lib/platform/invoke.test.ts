@@ -7,12 +7,12 @@ describe("platform 判定与能力表", () => {
     expect(platform).toBe("tauri");
   });
 
-  it("Web 端缺失的能力集中收敛在 capabilities 中", () => {
-    // tauri 平台下这些能力为 false 会破坏桌面端，这里只验证结构存在且类型稳定
-    expect(capabilities).toHaveProperty("tray");
-    expect(capabilities).toHaveProperty("nativeNotifications");
+  it("Web 端差异能力集中收敛在 capabilities 中", () => {
+    // 验证真实消费的能力存在且类型稳定（应用功能：测试连接/日志/版本已由后端提供，不再进能力表）
     expect(capabilities).toHaveProperty("windowControls");
-    expect(capabilities).toHaveProperty("nativeFileSystem");
+    expect(capabilities).toHaveProperty("defaultMailClient");
+    expect(capabilities).toHaveProperty("backgroundClose");
+    expect(capabilities).toHaveProperty("desktopSettings");
     expect(capabilities).toHaveProperty("browserDownloads");
   });
 

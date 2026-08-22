@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use pebble_core::{now_timestamp, new_id, Account, PebbleError, ProviderType};
+use pebble_core::{new_id, now_timestamp, Account, HttpProxyConfig, PebbleError, ProviderType};
 use pebble_mail::{ConnectionSecurity, ImapConfig, ProxyConfig, SmtpConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,12 @@ pub enum AccountProxyMode {
     Inherit,
     Disabled,
     Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountProxySetting {
+    pub mode: AccountProxyMode,
+    pub proxy: Option<HttpProxyConfig>,
 }
 
 /// 与桌面端 StoredAccountCredentials 字节级一致的存储结构（auth_data 数据格式兼容）。
@@ -132,13 +139,55 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn account_proxy_from_credentials(credentials: &AccountCredentials) -> Option<HttpProxyConfig> {
+    credentials
+        .imap
+        .proxy
+        .as_ref()
+        .or(credentials.smtp.proxy.as_ref())
+        .map(|proxy| HttpProxyConfig {
+            host: proxy.host.clone(),
+            port: proxy.port,
+        })
+}
+
+fn account_proxy_setting_from_credentials(credentials: &AccountCredentials) -> AccountProxySetting {
+    let proxy = account_proxy_from_credentials(credentials);
+    let mode = if matches!(credentials.proxy_mode, AccountProxyMode::Inherit) && proxy.is_some() {
+        AccountProxyMode::Custom
+    } else {
+        credentials.proxy_mode
+    };
+    AccountProxySetting {
+        proxy: if matches!(mode, AccountProxyMode::Custom) {
+            proxy
+        } else {
+            None
+        },
+        mode,
+    }
+}
+
+fn set_account_proxy_setting_on_credentials(
+    credentials: &mut AccountCredentials,
+    setting: AccountProxySetting,
+) {
+    credentials.proxy_mode = setting.mode;
+    let proxy = setting.proxy.map(|proxy| ProxyConfig {
+        host: proxy.host,
+        port: proxy.port,
+    });
+    credentials.imap.proxy = proxy.clone();
+    credentials.smtp.proxy = proxy;
+}
+
 /// 与桌面端 account_colors.rs 完全一致的取色逻辑（12 色预设 + 稳定 hash）。
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
 ];
 
-fn default_account_color(existing_accounts: &[Account], seed: &str) -> String {
+pub(crate) fn default_account_color(existing_accounts: &[Account], seed: &str) -> String {
     let used_colors: HashSet<String> = existing_accounts
         .iter()
         .filter_map(|account| account.color.as_deref())
@@ -165,7 +214,7 @@ fn default_account_color(existing_accounts: &[Account], seed: &str) -> String {
 }
 
 /// 与桌面端一致的明文连接安全校验。
-fn validate_connection_security(
+pub(crate) fn validate_connection_security(
     label: &str,
     host: &str,
     security: &ConnectionSecurity,
@@ -186,7 +235,10 @@ fn validate_connection_security(
 
 fn is_loopback_mail_host(host: &str) -> bool {
     matches!(
-        host.trim().trim_matches(&['[', ']'][..]).to_ascii_lowercase().as_str(),
+        host.trim()
+            .trim_matches(&['[', ']'][..])
+            .to_ascii_lowercase()
+            .as_str(),
         "localhost" | "127.0.0.1" | "::1"
     )
 }
@@ -199,19 +251,31 @@ fn resolve_username(username: &str, email: &str) -> String {
     }
 }
 
-fn proxy_config_from_parts(
+pub(crate) fn proxy_config_from_parts(
     host: Option<String>,
     port: Option<u16>,
     label: &str,
 ) -> Result<Option<ProxyConfig>, PebbleError> {
     match (host, port) {
-        (Some(h), Some(p)) if !h.trim().is_empty() && p != 0 => {
-            Ok(Some(ProxyConfig { host: h.trim().to_string(), port: p }))
-        }
         (None, None) => Ok(None),
-        _ => Err(PebbleError::Validation(format!(
-            "{label} requires both proxy host and port"
+        (Some(host), None) if host.trim().is_empty() => Ok(None),
+        (Some(_), None) => Err(PebbleError::Validation(format!(
+            "{label} port is required when proxy host is set"
         ))),
+        (None, Some(_)) => Err(PebbleError::Validation(format!(
+            "{label} host is required when proxy port is set"
+        ))),
+        (Some(host), Some(port)) => {
+            let proxy = HttpProxyConfig {
+                host: host.trim().to_string(),
+                port,
+            };
+            proxy.validate().map_err(PebbleError::Validation)?;
+            Ok(Some(ProxyConfig {
+                host: proxy.host,
+                port: proxy.port,
+            }))
+        }
     }
 }
 
@@ -220,12 +284,155 @@ pub async fn list_accounts(state: AppStateRef, _args: Value) -> Result<Value, Ap
     serde_json::to_value(accounts).map_err(ApiError::from_serialize)
 }
 
-/// 创建邮件账户（P0：IMAP/SMTP）。Gmail/Outlook/POP3 提供器后续批次接入。
+#[derive(Deserialize)]
+struct AccountProxyArgs {
+    account_id: String,
+}
+
+pub async fn get_account_proxy(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    let args: AccountProxyArgs = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid get_account_proxy args: {e}")))?;
+    let setting = get_account_proxy_setting_value(&state, &args.account_id)?;
+    serde_json::to_value(setting.proxy).map_err(ApiError::from_serialize)
+}
+
+pub async fn get_account_proxy_setting(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    let args: AccountProxyArgs = serde_json::from_value(args).map_err(|e| {
+        ApiError::BadRequest(format!("invalid get_account_proxy_setting args: {e}"))
+    })?;
+    serde_json::to_value(get_account_proxy_setting_value(&state, &args.account_id)?)
+        .map_err(ApiError::from_serialize)
+}
+
+fn get_account_proxy_setting_value(
+    state: &AppStateRef,
+    account_id: &str,
+) -> Result<AccountProxySetting, ApiError> {
+    let account = state
+        .store
+        .get_account(account_id)
+        .map_err(ApiError::from_store)?
+        .ok_or_else(|| ApiError::NotFound(format!("account not found: {account_id}")))?;
+    if !matches!(account.provider, ProviderType::Imap | ProviderType::Pop3) {
+        return Err(ApiError::from_pebble(PebbleError::UnsupportedProvider(
+            "Use the OAuth account proxy commands for Gmail and Outlook accounts".to_string(),
+        )));
+    }
+    let Some(bytes) = credentials::load_account_auth_data(&state.crypto, &state.store, account_id)
+        .map_err(ApiError::Internal)?
+    else {
+        return Ok(AccountProxySetting {
+            mode: AccountProxyMode::Inherit,
+            proxy: None,
+        });
+    };
+    let credentials: AccountCredentials = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::Internal(format!("failed to parse stored credentials: {e}")))?;
+    Ok(account_proxy_setting_from_credentials(&credentials))
+}
+
+#[derive(Deserialize)]
+struct UpdateAccountProxyArgs {
+    account_id: String,
+    #[serde(default)]
+    proxy_host: Option<String>,
+    #[serde(default)]
+    proxy_port: Option<u16>,
+}
+
+pub async fn update_account_proxy(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    let args: UpdateAccountProxyArgs = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid update_account_proxy args: {e}")))?;
+    let proxy = proxy_config_from_parts(args.proxy_host, args.proxy_port, "Account proxy")
+        .map_err(ApiError::from_pebble)?;
+    let setting = AccountProxySetting {
+        mode: if proxy.is_some() {
+            AccountProxyMode::Custom
+        } else {
+            AccountProxyMode::Inherit
+        },
+        proxy: proxy.map(|proxy| HttpProxyConfig {
+            host: proxy.host,
+            port: proxy.port,
+        }),
+    };
+    update_account_proxy_setting_value(&state, &args.account_id, setting)?;
+    Ok(Value::Null)
+}
+
+#[derive(Deserialize)]
+struct UpdateAccountProxySettingArgs {
+    account_id: String,
+    mode: AccountProxyMode,
+    #[serde(default)]
+    proxy_host: Option<String>,
+    #[serde(default)]
+    proxy_port: Option<u16>,
+}
+
+pub async fn update_account_proxy_setting(
+    state: AppStateRef,
+    args: Value,
+) -> Result<Value, ApiError> {
+    let args: UpdateAccountProxySettingArgs = serde_json::from_value(args).map_err(|e| {
+        ApiError::BadRequest(format!("invalid update_account_proxy_setting args: {e}"))
+    })?;
+    let proxy = proxy_config_from_parts(args.proxy_host, args.proxy_port, "Account proxy")
+        .map_err(ApiError::from_pebble)?;
+    let proxy = match args.mode {
+        AccountProxyMode::Custom => Some(proxy.ok_or_else(|| {
+            ApiError::BadRequest("custom account proxy requires host and port".to_string())
+        })?),
+        AccountProxyMode::Inherit | AccountProxyMode::Disabled => None,
+    };
+    let proxy = proxy.map(|proxy| HttpProxyConfig {
+        host: proxy.host,
+        port: proxy.port,
+    });
+    update_account_proxy_setting_value(
+        &state,
+        &args.account_id,
+        AccountProxySetting {
+            mode: args.mode,
+            proxy,
+        },
+    )?;
+    Ok(Value::Null)
+}
+
+fn update_account_proxy_setting_value(
+    state: &AppStateRef,
+    account_id: &str,
+    setting: AccountProxySetting,
+) -> Result<(), ApiError> {
+    let current = get_account_proxy_setting_value(state, account_id)?;
+    let Some(bytes) = credentials::load_account_auth_data(&state.crypto, &state.store, account_id)
+        .map_err(ApiError::Internal)?
+    else {
+        return Err(ApiError::BadRequest(format!(
+            "no auth data found for account {account_id}"
+        )));
+    };
+    let mut credentials: AccountCredentials = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::Internal(format!("failed to parse stored credentials: {e}")))?;
+    set_account_proxy_setting_on_credentials(&mut credentials, setting);
+    if current == account_proxy_setting_from_credentials(&credentials) {
+        return Ok(());
+    }
+    let serialized = serde_json::to_vec(&credentials).map_err(ApiError::from_serialize)?;
+    credentials::store_account_auth_data(&state.crypto, &state.store, account_id, &serialized)
+        .map_err(ApiError::Internal)
+}
+
+/// 创建邮件账户（IMAP/SMTP 或 POP3/SMTP）。OAuth 提供器走独立浏览器流程。
 pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let request: AddAccountRequest = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid add_account args: {e}")))?;
+    // 与上游 Tauri 命令签名一致：前端 invoke 传 { request: AddAccountRequest }
+    let request: AddAccountRequest =
+        serde_json::from_value(args.get("request").cloned().unwrap_or(Value::Null))
+            .map_err(|e| ApiError::BadRequest(format!("invalid add_account args: {e}")))?;
     let provider = match request.provider.to_lowercase().as_str() {
         "imap" => ProviderType::Imap,
+        "pop3" => ProviderType::Pop3,
         other => {
             return Err(ApiError::BadRequest(format!(
                 "provider {other} not supported yet"
@@ -233,8 +440,13 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
         }
     };
 
+    let incoming_label = if matches!(provider, ProviderType::Pop3) {
+        "POP3"
+    } else {
+        "IMAP"
+    };
     validate_connection_security(
-        "IMAP",
+        incoming_label,
         &request.imap_host,
         &request.imap_security,
         request.allow_plaintext,
@@ -267,7 +479,8 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 
     // 后续步骤失败则回滚账户行，避免半成品账户（与桌面端一致）
     if let Err(e) = (|| -> Result<(), PebbleError> {
-        let proxy = proxy_config_from_parts(request.proxy_host, request.proxy_port, "Account proxy")?;
+        let proxy =
+            proxy_config_from_parts(request.proxy_host, request.proxy_port, "Account proxy")?;
         let proxy_mode = if proxy.is_some() {
             AccountProxyMode::Custom
         } else {
@@ -301,15 +514,26 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 
         let config_bytes =
             serde_json::to_vec(&credentials).map_err(|e| PebbleError::Internal(e.to_string()))?;
-        credentials::store_account_auth_data(&state.crypto, &state.store, &account.id, &config_bytes)
-            .map_err(|e| PebbleError::Internal(e.to_string()))?;
+        credentials::store_account_auth_data(
+            &state.crypto,
+            &state.store,
+            &account.id,
+            &config_bytes,
+        )
+        .map_err(|e| PebbleError::Internal(e.to_string()))?;
 
         state
             .store
             .update_sync_state(&account.id, |s| {
-                s.provider = Some("imap".to_string());
-                // 新 IMAP 账户默认只同步收件箱，其余邮箱由账户编辑器按需开启
-                s.selected_imap_folder_remote_ids = Some(Vec::new());
+                s.provider = Some(if matches!(provider, ProviderType::Pop3) {
+                    "pop3".to_string()
+                } else {
+                    "imap".to_string()
+                });
+                if matches!(provider, ProviderType::Imap) {
+                    // 新 IMAP 账户默认只同步收件箱，其余邮箱由账户编辑器按需开启
+                    s.selected_imap_folder_remote_ids = Some(Vec::new());
+                }
             })
             .map_err(|e| PebbleError::Internal(e.to_string()))?;
 
@@ -400,47 +624,41 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
         .ok_or_else(|| ApiError::NotFound("account not found".to_string()))?;
 
     // 解析现有凭据；缺失时（首次编辑或 OAuth 旧账户）以空模板开始（与桌面端一致）
-    let mut creds = match credentials::load_account_auth_data(
-        &state.crypto,
-        &state.store,
-        &req.account_id,
-    )? {
-        Some(bytes) => serde_json::from_slice::<AccountCredentials>(&bytes)
-            .map_err(|e| ApiError::Internal(format!("failed to parse stored credentials: {e}")))?,
-        None => AccountCredentials {
-            proxy_mode: AccountProxyMode::Inherit,
-            imap: StoredMailConfig {
-                host: String::new(),
-                port: 0,
-                username: String::new(),
-                password: String::new(),
-                security: None,
-                use_tls: None,
-                accept_invalid_certs: false,
-                proxy: None,
+    let mut creds =
+        match credentials::load_account_auth_data(&state.crypto, &state.store, &req.account_id)? {
+            Some(bytes) => serde_json::from_slice::<AccountCredentials>(&bytes).map_err(|e| {
+                ApiError::Internal(format!("failed to parse stored credentials: {e}"))
+            })?,
+            None => AccountCredentials {
+                proxy_mode: AccountProxyMode::Inherit,
+                imap: StoredMailConfig {
+                    host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    password: String::new(),
+                    security: None,
+                    use_tls: None,
+                    accept_invalid_certs: false,
+                    proxy: None,
+                },
+                smtp: StoredMailConfig {
+                    host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    password: String::new(),
+                    security: None,
+                    use_tls: None,
+                    accept_invalid_certs: false,
+                    proxy: None,
+                },
+                allow_plaintext: false,
             },
-            smtp: StoredMailConfig {
-                host: String::new(),
-                port: 0,
-                username: String::new(),
-                password: String::new(),
-                security: None,
-                use_tls: None,
-                accept_invalid_certs: false,
-                proxy: None,
-            },
-            allow_plaintext: false,
-        },
-    };
+        };
 
     let updated_proxy = if req.proxy_host.is_some() || req.proxy_port.is_some() {
         Some(
-            proxy_config_from_parts(
-                req.proxy_host.clone(),
-                req.proxy_port,
-                "Account proxy",
-            )
-            .map_err(ApiError::from_pebble)?,
+            proxy_config_from_parts(req.proxy_host.clone(), req.proxy_port, "Account proxy")
+                .map_err(ApiError::from_pebble)?,
         )
     } else {
         None
@@ -492,7 +710,11 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
     creds.smtp.username = resolve_username(&creds.smtp.username, &req.email);
 
     // allow_plaintext 仅创建时设置；编辑时由 反序列化→序列化 往返保留（与桌面端一致）
-    let incoming_label = if provider == ProviderType::Pop3 { "POP3" } else { "IMAP" };
+    let incoming_label = if provider == ProviderType::Pop3 {
+        "POP3"
+    } else {
+        "IMAP"
+    };
     validate_connection_security(
         incoming_label,
         &creds.imap.host,
@@ -538,14 +760,115 @@ pub struct DeleteAccountRequest {
     pub account_id: String,
 }
 
+fn account_attachment_paths(
+    store: &pebble_store::Store,
+    account_id: &str,
+) -> Result<Vec<String>, PebbleError> {
+    let mut paths = HashSet::new();
+    for message_id in store.list_message_ids_by_account(account_id)? {
+        for attachment in store.list_attachments_by_message(&message_id)? {
+            if let Some(path) = attachment.local_path {
+                paths.insert(path);
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// Remove only files owned by the configured attachment root. Attachment
+/// paths are persisted data, so validate the canonical path before deleting
+/// anything and leave missing/already-cleaned files alone.
+fn cleanup_account_attachment_paths(attachments_dir: &Path, paths: &[String]) {
+    let Ok(root) = attachments_dir.canonicalize() else {
+        return;
+    };
+    for raw_path in paths {
+        let candidate = Path::new(raw_path);
+        let candidate = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(&root) || canonical == root || !canonical.is_file() {
+            continue;
+        }
+        let _ = std::fs::remove_file(&canonical);
+        let mut parent = canonical.parent().map(PathBuf::from);
+        while let Some(dir) = parent {
+            if dir == root || !dir.starts_with(&root) {
+                break;
+            }
+            let is_empty = std::fs::read_dir(&dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !is_empty || std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+            parent = dir.parent().map(PathBuf::from);
+        }
+    }
+}
+
 pub async fn delete_account(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     let req: DeleteAccountRequest = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid delete_account args: {e}")))?;
-    // TODO: 同步句柄停止 + 消息附件清理，待同步服务接入后补齐
+
+    if !state
+        .sync_manager
+        .stop_account_and_wait(&req.account_id, std::time::Duration::from_secs(30))
+        .await
+    {
+        return Err(ApiError::Internal(format!(
+            "timed out waiting for account sync to stop: {}",
+            req.account_id
+        )));
+    }
+    let attachment_paths =
+        account_attachment_paths(&state.store, &req.account_id).map_err(ApiError::from_store)?;
     state
         .store
         .delete_account(&req.account_id)
         .map_err(ApiError::from_store)?;
     credentials::clear_account_auth_data(&state.store, &req.account_id)?;
+    state
+        .search
+        .delete_by_account(&req.account_id)
+        .map_err(ApiError::from_pebble)?;
+    cleanup_account_attachment_paths(&state.attachments_dir, &attachment_paths);
     Ok(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_account_attachment_paths;
+
+    #[test]
+    fn account_attachment_cleanup_stays_inside_root() {
+        let root =
+            std::env::temp_dir().join(format!("pw-account-cleanup-{}", uuid::Uuid::new_v4()));
+        let owned = root.join("message-1").join("attachment-1");
+        let outside = root
+            .parent()
+            .expect("temp root has a parent")
+            .join(format!("pw-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        std::fs::write(&owned, b"owned").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        cleanup_account_attachment_paths(
+            &root,
+            &[
+                owned.to_string_lossy().into_owned(),
+                outside.to_string_lossy().into_owned(),
+            ],
+        );
+
+        assert!(!owned.exists());
+        assert!(outside.exists());
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

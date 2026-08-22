@@ -14,6 +14,11 @@
  */
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getWebToken } from "./session";
+import { platform } from "./invoke";
+import {
+  WEB_ATTACHMENT_DOWNLOAD_PROGRESS_EVENT,
+  WEB_NOTIFICATION_OPEN_EVENT,
+} from "./localEvents";
 
 /**
  * 事件名登记表（阶段 6.6 起定位调整为「登记/动态订阅用」）。
@@ -87,6 +92,10 @@ let wsAuthenticated = false;
 let wsSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const wsHandlers = new Map<string, Set<(event: TauriEvent<unknown>) => void>>();
+const WEB_LOCAL_EVENT_NAMES: Partial<Record<string, string>> = {
+  [EVENTS.notificationOpen]: WEB_NOTIFICATION_OPEN_EVENT,
+  [EVENTS.downloadProgress]: WEB_ATTACHMENT_DOWNLOAD_PROGRESS_EVENT,
+};
 
 /** 是否需要连接：有 token 且有订阅者。 */
 function shouldConnect(): boolean {
@@ -175,7 +184,7 @@ export function listen<T>(
   handler: (event: TauriEvent<T>) => void,
   options?: EventOptions,
 ): Promise<UnlistenFn> {
-  if (!import.meta.env.VITE_PLATFORM) {
+  if (platform === "tauri") {
     return tauriListen<T>(event, handler, options);
   }
 
@@ -186,9 +195,27 @@ export function listen<T>(
     wsHandlers.set(event, handlers);
   }
   handlers.add(handler as (e: TauriEvent<unknown>) => void);
+
+  // Browser-only APIs that cannot publish through the WebSocket transport
+  // still enter the same Tauri-shaped event contract at this boundary.
+  const localEventName =
+    typeof window !== "undefined" ? WEB_LOCAL_EVENT_NAMES[event] : undefined;
+  const onLocalEvent = localEventName
+    ? (raw: Event) => {
+        const payload = (raw as CustomEvent<unknown>).detail ?? {};
+        handler({ event, id: ++wsSeq, payload } as TauriEvent<T>);
+      }
+    : null;
+  if (localEventName && onLocalEvent) {
+    window.addEventListener(localEventName, onLocalEvent);
+  }
+
   connectWebSocket();
 
   return Promise.resolve(() => {
+    if (localEventName && onLocalEvent) {
+      window.removeEventListener(localEventName, onLocalEvent);
+    }
     handlers.delete(handler as (e: TauriEvent<unknown>) => void);
     if (handlers.size === 0) {
       wsHandlers.delete(event);

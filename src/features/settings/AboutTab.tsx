@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
 import { useTranslation } from "react-i18next";
-import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@/lib/platform";
+import { getVersion, invoke } from "@/lib/platform";
 import { Copy, RefreshCw, X } from "lucide-react";
 import iconUrl from "@/assets/app-icon.png";
 import { readAppLog, type AppLogSnapshot } from "@/lib/api";

@@ -8,6 +8,7 @@ import {
 } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
+import { capabilities } from "@/lib/platform";
 
 const REALTIME_OPTIONS: Array<{
   mode: RealtimePreference;
@@ -131,6 +132,8 @@ export default function GeneralTab() {
 
   return (
     <div>
+      {capabilities.desktopSettings && (
+        <>
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
         {t("settings.realtimeMode", "Realtime Mode")}
       </h3>
@@ -271,6 +274,8 @@ export default function GeneralTab() {
         />
         <span>{t("settings.quitOnClose", "Quit app when window is closed")}</span>
       </label>
+        </>
+      )}
 
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
         {t("settings.folderCounts", "Folder Counts")}
@@ -293,7 +298,7 @@ export default function GeneralTab() {
         <span>{t("settings.showUnreadCount", "Show unread count badges in sidebar")}</span>
       </label>
 
-      {navigator.userAgent.includes("Windows") && (
+      {capabilities.defaultMailClient && navigator.userAgent.includes("Windows") && (
         <>
           <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
             {t("settings.defaultMailClient", "Default Email Client")}

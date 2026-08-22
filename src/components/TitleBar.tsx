@@ -1,5 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
+import { capabilities } from "@/lib/platform";
 import iconUrl from "@/assets/app-icon.png";
 import { isComposeDirty } from "@/stores/compose.store";
 import { useConfirmStore } from "@/stores/confirm.store";
@@ -8,6 +9,9 @@ import i18n from "@/lib/i18n";
 const isMac = navigator.userAgent.includes("Macintosh");
 
 export default function TitleBar() {
+  // Web：浏览器标签栏即窗口控制，无自定义标题栏
+  if (!capabilities.windowControls) return null;
+
   const { t } = useTranslation();
   const appWindow = getCurrentWindow();
 

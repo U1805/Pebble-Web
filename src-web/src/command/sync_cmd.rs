@@ -2,6 +2,18 @@ use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::state::AppStateRef;
+
+fn realtime_preference_interval(mode: &str) -> Result<u64, ApiError> {
+    match mode {
+        "realtime" => Ok(3),
+        "balanced" => Ok(15),
+        "battery" => Ok(60),
+        "manual" => Ok(0),
+        other => Err(ApiError::BadRequest(format!(
+            "invalid realtime preference: {other}"
+        ))),
+    }
+}
 /// 手动触发一次同步（立即执行，不等定时周期）。reason 兼容桌面端 SyncTrigger 语义。
 pub async fn trigger_sync(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
@@ -55,7 +67,7 @@ pub async fn start_sync(state: AppStateRef, args: Value) -> Result<Value, ApiErr
     Ok(json!({ "started": true }))
 }
 
-/// stop_sync：Web 端无长驻连接（每轮同步即断开），命令保持兼容返回提示。
+/// stop_sync：向当前账户 worker 发送取消信号；空闲账户保持幂等成功。
 pub async fn stop_sync(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
     struct Args {
@@ -63,12 +75,29 @@ pub async fn stop_sync(state: AppStateRef, args: Value) -> Result<Value, ApiErro
     }
     let a: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid stop_sync args: {e}")))?;
-    let _ = state;
+    let stopped = state.sync_manager.stop_account(&a.account_id).await;
     Ok(json!({
         "stopped": true,
         "account_id": a.account_id,
-        "note": "web sync is scheduler-managed; no persistent connection to stop"
+        "running_worker_cancelled": stopped
     }))
+}
+
+/// Apply the Web scheduler's automatic sync preference.
+pub async fn set_realtime_preference(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        mode: String,
+    }
+    let args: Args = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid set_realtime_preference args: {e}")))?;
+    let interval = realtime_preference_interval(&args.mode)?;
+    state.sync_manager.set_poll_interval_secs(interval);
+    state
+        .sync_manager
+        .publish_realtime_preference_status(interval)
+        .await;
+    Ok(Value::Null)
 }
 
 /// 待处理操作统计（失败/重试队列）。
@@ -132,4 +161,18 @@ pub async fn dismiss_failed_pending_mail_ops(
         .dismiss_failed_pending_mail_ops(account_id.as_deref())
         .map_err(ApiError::from_store)?;
     Ok(json!({ "dismissed": dismissed }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::realtime_preference_interval;
+
+    #[test]
+    fn realtime_preference_maps_to_scheduler_intervals() {
+        assert_eq!(realtime_preference_interval("realtime").unwrap(), 3);
+        assert_eq!(realtime_preference_interval("balanced").unwrap(), 15);
+        assert_eq!(realtime_preference_interval("battery").unwrap(), 60);
+        assert_eq!(realtime_preference_interval("manual").unwrap(), 0);
+        assert!(realtime_preference_interval("turbo").is_err());
+    }
 }

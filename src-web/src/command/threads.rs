@@ -18,7 +18,9 @@ pub async fn list_threads(state: AppStateRef, args: Value) -> Result<Value, ApiE
         .map_err(|e| ApiError::BadRequest(format!("invalid list_threads args: {e}")))?;
     let store = state.store.clone();
     let threads = run_blocking(move || match args.folder_ids {
-        Some(ids) if !ids.is_empty() => store.list_threads_by_folders(&ids, args.limit, args.offset),
+        Some(ids) if !ids.is_empty() => {
+            store.list_threads_by_folders(&ids, args.limit, args.offset)
+        }
         _ => store.list_threads_by_folder(&args.folder_id, args.limit, args.offset),
     })
     .await?;

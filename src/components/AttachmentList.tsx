@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@/lib/platform";
+import { getAttachmentSavePath, listen } from "@/lib/platform";
 import { File, FileText, Image, FileArchive, Film, Music, Download, Loader, Check } from "lucide-react";
 import { listAttachments, downloadAttachment } from "@/lib/api";
 import type { Attachment } from "@/lib/api";
-import { sanitizeFilename } from "@/lib/sanitizeFilename";
 import { useToastStore } from "@/stores/toast.store";
 
 interface Props {
@@ -81,10 +80,7 @@ export default function AttachmentList({ messageId }: Props) {
   async function handleDownload(attachment: Attachment) {
     setDownloadingId(attachment.id);
     try {
-      const { downloadDir } = await import("@tauri-apps/api/path");
-      const dir = await downloadDir();
-      const safeName = sanitizeFilename(attachment.filename);
-      const savePath = `${dir}/${safeName}`;
+      const savePath = await getAttachmentSavePath(attachment.filename);
       const downloadedPath = await downloadAttachment(attachment.id, savePath);
       setDownloadedPaths((prev) => ({ ...prev, [attachment.id]: downloadedPath }));
       setDownloadProgress((prev) => { const next = { ...prev }; delete next[attachment.id]; return next; });

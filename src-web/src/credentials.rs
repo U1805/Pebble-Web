@@ -5,6 +5,9 @@ use pebble_store::Store;
 /// 保持同一 purpose 字符串，Web 与桌面端读写同一数据目录时凭据互兼容。
 pub const ACCOUNT_AUTH_DATA_PURPOSE: &str = "accounts.auth_data";
 
+/// 通用私密用户数据加密用途（桌面端同值）。
+pub const SECURE_USER_DATA_PURPOSE: &str = "secure_user_data.value";
+
 /// 加密账户凭据并落库（AAD 绑定 account_id）。
 pub fn store_account_auth_data(
     crypto: &CryptoService,

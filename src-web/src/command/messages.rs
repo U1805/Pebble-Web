@@ -19,7 +19,9 @@ pub async fn list_messages(state: AppStateRef, args: Value) -> Result<Value, Api
         .map_err(|e| ApiError::BadRequest(format!("invalid list_messages args: {e}")))?;
     let store = state.store.clone();
     let messages = run_blocking(move || match args.folder_ids {
-        Some(ids) if !ids.is_empty() => store.list_messages_by_folders(&ids, args.limit, args.offset),
+        Some(ids) if !ids.is_empty() => {
+            store.list_messages_by_folders(&ids, args.limit, args.offset)
+        }
         _ => store.list_messages_by_folder(&args.folder_id, args.limit, args.offset),
     })
     .await?;
@@ -36,14 +38,19 @@ pub async fn list_starred_messages(state: AppStateRef, args: Value) -> Result<Va
     let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid list_starred_messages args: {e}")))?;
     let store = state.store.clone();
-    let messages =
-        run_blocking(move || store.list_starred_messages(&args.account_id, args.limit, args.offset))
-            .await?;
+    let messages = run_blocking(move || {
+        store.list_starred_messages(&args.account_id, args.limit, args.offset)
+    })
+    .await?;
     serde_json::to_value(messages).map_err(ApiError::from_serialize)
 }
 
 pub async fn get_message(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let message_id: String = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        message_id: String,
+    }
+    let Args { message_id } = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid get_message args: {e}")))?;
     let store = state.store.clone();
     let message = run_blocking(move || store.get_message(&message_id)).await?;
@@ -51,7 +58,11 @@ pub async fn get_message(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 }
 
 pub async fn get_messages_batch(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let message_ids: Vec<String> = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        message_ids: Vec<String>,
+    }
+    let Args { message_ids } = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid get_messages_batch args: {e}")))?;
     let store = state.store.clone();
     let messages = run_blocking(move || store.get_messages_batch(&message_ids)).await?;
@@ -69,18 +80,12 @@ pub async fn get_rendered_html(state: AppStateRef, args: Value) -> Result<Value,
         .map_err(|e| ApiError::BadRequest(format!("invalid get_rendered_html args: {e}")))?;
     let store = state.store.clone();
     let rendered = run_blocking(move || {
-        let message = store
-            .get_message(&args.message_id)?
-            .ok_or_else(|| {
-                pebble_core::PebbleError::Internal(format!("Message not found: {}", args.message_id))
-            })?;
+        let message = store.get_message(&args.message_id)?.ok_or_else(|| {
+            pebble_core::PebbleError::Internal(format!("Message not found: {}", args.message_id))
+        })?;
         let effective_mode = resolve_privacy_mode(&store, &message, args.privacy_mode)?;
         let guard = PrivacyGuard::new();
-        Ok(guard.render_message_html(
-            &message.body_html_raw,
-            &message.body_text,
-            &effective_mode,
-        ))
+        Ok(guard.render_message_html(&message.body_html_raw, &message.body_text, &effective_mode))
     })
     .await?;
     serde_json::to_value(rendered).map_err(ApiError::from_serialize)
@@ -101,11 +106,8 @@ pub async fn get_message_with_html(state: AppStateRef, args: Value) -> Result<Va
         };
         let effective_mode = resolve_privacy_mode(&store, &message, args.privacy_mode)?;
         let guard = PrivacyGuard::new();
-        let rendered = guard.render_message_html(
-            &message.body_html_raw,
-            &message.body_text,
-            &effective_mode,
-        );
+        let rendered =
+            guard.render_message_html(&message.body_html_raw, &message.body_text, &effective_mode);
         Ok(Some((message, rendered)))
     })
     .await?;
@@ -122,7 +124,9 @@ pub async fn is_trusted_sender(state: AppStateRef, args: Value) -> Result<Value,
         .map_err(|e| ApiError::BadRequest(format!("invalid is_trusted_sender args: {e}")))?;
     let store = state.store.clone();
     let trusted = run_blocking(move || {
-        Ok(store.is_trusted_sender(&args.account_id, &args.email)?.is_some())
+        Ok(store
+            .is_trusted_sender(&args.account_id, &args.email)?
+            .is_some())
     })
     .await?;
     serde_json::to_value(trusted).map_err(ApiError::from_serialize)
