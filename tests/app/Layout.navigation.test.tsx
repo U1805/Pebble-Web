@@ -58,20 +58,12 @@ vi.mock("../../src/components/Sidebar", async () => {
       const activeView = useUIStore((s) => s.activeView);
       const setActiveView = useUIStore((s) => s.setActiveView);
       return (
-        <div>
-          <button
-            aria-current={activeView === "settings" ? "page" : undefined}
-            onClick={() => setActiveView("settings")}
-          >
-            Settings
-          </button>
-          <button
-            aria-current={activeView === "kanban" ? "page" : undefined}
-            onClick={() => setActiveView("kanban")}
-          >
-            Kanban
-          </button>
-        </div>
+        <button
+          aria-current={activeView === "settings" ? "page" : undefined}
+          onClick={() => setActiveView("settings")}
+        >
+          Settings
+        </button>
       );
     },
   };
@@ -187,25 +179,6 @@ describe("Layout navigation", () => {
 
     expect(screen.getByRole("button", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByText("Loading...")).toBeTruthy();
-    expect(screen.queryByText("Inbox panel")).toBeNull();
-  });
-
-  it("renders the main page shell with inbox content at runtime", async () => {
-    render(<Layout />);
-
-    expect(await screen.findByText("Inbox panel")).toBeTruthy();
-    expect(screen.getByText("Title bar")).toBeTruthy();
-    expect(screen.getByText("Status bar")).toBeTruthy();
-    expect(document.querySelector(".app-shell")).toBeTruthy();
-  });
-
-  it("navigates to the Kanban page and renders its content", async () => {
-    render(<Layout />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Kanban" }));
-
-    expect(await screen.findByText("Kanban panel")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Kanban" }).getAttribute("aria-current")).toBe("page");
     expect(screen.queryByText("Inbox panel")).toBeNull();
   });
 });

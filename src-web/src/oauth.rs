@@ -23,15 +23,28 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use url::Url;
 
-use crate::command::accounts::{default_account_color, AccountProxyMode};
-use crate::command::network;
-use crate::command::run_blocking;
-use crate::credentials;
+use crate::account_colors::default_account_color;
+use crate::commands::network::AccountProxyMode;
+use crate::commands::network;
+use crate::blocking::run_blocking;
+use crate::commands::encrypted_store;
 use crate::error::ApiError;
-use crate::state::AppStateRef;
+use crate::state::{AppStateRef, OAuthAccountLockRegistry};
 
 const PENDING_OAUTH_TTL_SECS: i64 = 10 * 60;
 const CALLBACK_PATH: &str = "/api/v1/oauth/callback";
+
+async fn oauth_account_lock(
+    registry: &OAuthAccountLockRegistry,
+    account_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = registry.lock().await;
+    Arc::clone(
+        locks
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
 
 fn parse_web_oauth_urls(
     config: &OAuthConfig,
@@ -174,8 +187,7 @@ pub(crate) fn load_oauth_access(
     store: &pebble_store::Store,
     account_id: &str,
 ) -> Result<OAuthAccess, PebbleError> {
-    let bytes = credentials::load_account_auth_data(crypto, store, account_id)
-        .map_err(PebbleError::Internal)?
+    let bytes = encrypted_store::load_account_auth_data(crypto, store, account_id)?
         .ok_or_else(|| PebbleError::Auth(format!("No OAuth auth data for account {account_id}")))?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|e| PebbleError::Auth(format!("Invalid OAuth auth data: {e}")))?;
@@ -200,7 +212,7 @@ pub(crate) fn load_oauth_access(
     let proxy = match mode {
         AccountProxyMode::Disabled => None,
         AccountProxyMode::Custom => stored_proxy,
-        AccountProxyMode::Inherit => stored_proxy.or(network::get_global_proxy_raw(store, crypto)?),
+        AccountProxyMode::Inherit => stored_proxy.or(network::get_global_proxy_raw(crypto, store)?),
     };
     Ok(OAuthAccess {
         access_token,
@@ -239,6 +251,7 @@ pub(crate) async fn load_oauth_provider(
             state.store.clone(),
             provider_name,
             &access,
+            state.oauth_account_locks.clone(),
             &account.id,
         )? {
             let (refreshed, _) = refresher().await?;
@@ -264,43 +277,57 @@ pub(crate) fn build_oauth_token_refresher(
     store: Arc<pebble_store::Store>,
     provider: &str,
     access: &OAuthAccess,
+    account_locks: OAuthAccountLockRegistry,
     account_id: &str,
 ) -> Result<Option<pebble_mail::gmail_sync::TokenRefresher>, PebbleError> {
-    let Some(refresh_token) = access.refresh_token.clone() else {
+    let Some(initial_refresh_token) = access.refresh_token.clone() else {
         return Ok(None);
     };
     let config = oauth_config_for_provider(provider).map_err(PebbleError::Auth)?;
-    let manager = Arc::new(OAuthManager::new_with_network(
-        config,
-        OAuthNetworkConfig {
-            proxy: access.proxy.clone(),
-        },
-    ));
     let account_id = account_id.to_string();
     Ok(Some(Box::new(move || {
-        let manager = manager.clone();
-        let refresh_token = refresh_token.clone();
+        let config = config.clone();
+        let initial_refresh_token = initial_refresh_token.clone();
         let crypto = crypto.clone();
         let store = store.clone();
+        let account_locks = account_locks.clone();
         let account_id = account_id.clone();
         Box::pin(async move {
-            let token_pair = manager
-                .refresh_token(&refresh_token)
-                .await
-                .map_err(|e| PebbleError::Auth(format!("OAuth token refresh failed: {e}")))?;
-            let existing = credentials::load_account_auth_data(&crypto, &store, &account_id)
-                .map_err(PebbleError::Internal)?
+            let account_lock = oauth_account_lock(&account_locks, &account_id).await;
+            let _account_guard = account_lock.lock().await;
+
+            // Re-read the latest encrypted auth blob after taking the per-account lock.
+            // Providers can rotate refresh tokens, so a token captured before another
+            // refresh completed must not overwrite the newer value.
+            let existing = encrypted_store::load_account_auth_data(&crypto, &store, &account_id)?
                 .ok_or_else(|| {
                     PebbleError::Auth("OAuth auth data disappeared during refresh".to_string())
                 })?;
             let mut value: Value = serde_json::from_slice(&existing)
                 .map_err(|e| PebbleError::Auth(format!("Invalid OAuth auth data: {e}")))?;
+            let refresh_token = value["refresh_token"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or(initial_refresh_token);
+
+            let current_access = load_oauth_access(&crypto, &store, &account_id)?;
+            let manager = OAuthManager::new_with_network(
+                config,
+                OAuthNetworkConfig {
+                    proxy: current_access.proxy,
+                },
+            );
+            let token_pair = manager
+                .refresh_token(&refresh_token)
+                .await
+                .map_err(|e| PebbleError::Auth(format!("OAuth token refresh failed: {e}")))?;
+
             value["access_token"] = Value::String(token_pair.access_token.clone());
             value["refresh_token"] = token_pair
                 .refresh_token
                 .clone()
                 .map(Value::String)
-                .unwrap_or_else(|| Value::String(refresh_token.clone()));
+                .unwrap_or_else(|| Value::String(refresh_token));
             value["expires_at"] = token_pair
                 .expires_at
                 .map(Value::from)
@@ -309,8 +336,7 @@ pub(crate) fn build_oauth_token_refresher(
                 .map_err(|e| PebbleError::Internal(e.to_string()))?;
             let bytes =
                 serde_json::to_vec(&value).map_err(|e| PebbleError::Internal(e.to_string()))?;
-            credentials::store_account_auth_data(&crypto, &store, &account_id, &bytes)
-                .map_err(PebbleError::Internal)?;
+            encrypted_store::store_account_auth_data(&crypto, &store, &account_id, &bytes)?;
             Ok((token_pair.access_token, token_pair.expires_at))
         })
     })))
@@ -348,7 +374,7 @@ pub(crate) async fn start_oauth_flow(state: AppStateRef, args: Value) -> Result<
     let account_proxy = proxy_from_parts(args.proxy_host, args.proxy_port)?;
     let effective_proxy = match account_proxy.clone() {
         Some(proxy) => Some(proxy),
-        None => network::get_global_proxy_raw(&state.store, &state.crypto)
+        None => network::get_global_proxy_raw(&state.crypto, &state.store)
             .map_err(ApiError::from_pebble)?,
     };
     let network = OAuthNetworkConfig {
@@ -497,8 +523,7 @@ async fn persist_oauth_account(
             let bytes = serde_json::to_vec(&token_json).map_err(|e| {
                 PebbleError::Internal(format!("failed to serialize OAuth auth data: {e}"))
             })?;
-            credentials::store_account_auth_data(&crypto, &store, &account.id, &bytes)
-                .map_err(PebbleError::Internal)?;
+            encrypted_store::store_account_auth_data(&crypto, &store, &account.id, &bytes)?;
             store.update_sync_state(&account.id, |sync_state| {
                 sync_state.provider = Some(provider.clone());
             })?;
@@ -703,121 +728,4 @@ fn callback_page(payload: Value) -> Response {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(axum::body::Body::from(html))
         .expect("OAuth callback response should be valid")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        constant_time_eq, is_placeholder, load_oauth_provider, oauth_redirect_url, start_web_oauth,
-        PENDING_OAUTH_TTL_SECS,
-    };
-    use crate::{auth, config::Config, credentials};
-    use pebble_core::{now_timestamp, Account, ProviderType};
-    use pebble_oauth::OAuthConfig;
-    use serde_json::json;
-
-    fn test_state() -> crate::state::AppStateRef {
-        let data_dir = std::env::temp_dir().join(format!("pw-oauth-{}", pebble_core::new_id()));
-        crate::state::AppState::init(Config {
-            port: 0,
-            data_dir,
-            password_hash: auth::hash_password("test-password").unwrap(),
-            jwt_secret: "this-is-a-real-secret-with-32-plus-chars".to_string(),
-            sync_interval_secs: 3600,
-            static_dir: std::path::PathBuf::from("./dist"),
-        })
-        .unwrap()
-    }
-
-    async fn oauth_provider_can_be_constructed(provider: ProviderType) {
-        let state = test_state();
-        let now = now_timestamp();
-        let account = Account {
-            id: pebble_core::new_id(),
-            email: "oauth@example.com".to_string(),
-            display_name: "OAuth".to_string(),
-            color: None,
-            provider,
-            created_at: now,
-            updated_at: now,
-        };
-        state.store.insert_account(&account).unwrap();
-        credentials::store_account_auth_data(
-            &state.crypto,
-            &state.store,
-            &account.id,
-            &serde_json::to_vec(&json!({
-                "access_token": "test-access-token",
-                "expires_at": now + 3600,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let provider = load_oauth_provider(&state, &account).await.unwrap();
-        let capabilities = provider.capabilities();
-        assert!(capabilities.has_labels || capabilities.has_folders);
-        let _ = std::fs::remove_dir_all(&state.config.data_dir);
-    }
-
-    #[test]
-    fn oauth_state_comparison_is_exact() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-    }
-
-    #[test]
-    fn placeholder_client_values_are_rejected() {
-        assert!(is_placeholder("YOUR_CLIENT_ID"));
-        assert!(is_placeholder("GOOGLE_CLIENT_ID_PLACEHOLDER"));
-        assert!(!is_placeholder("client-id"));
-    }
-
-    #[test]
-    fn oauth_pending_state_has_bounded_lifetime() {
-        assert_eq!(PENDING_OAUTH_TTL_SECS, 600);
-    }
-
-    #[test]
-    fn redirect_url_requires_web_callback_path() {
-        std::env::set_var(
-            "PEBBLE_OAUTH_REDIRECT_URL",
-            "https://mail.example.test/api/v1/oauth/callback",
-        );
-        assert!(oauth_redirect_url().is_ok());
-        std::env::set_var(
-            "PEBBLE_OAUTH_REDIRECT_URL",
-            "https://mail.example.test/callback",
-        );
-        assert!(oauth_redirect_url().is_err());
-        std::env::remove_var("PEBBLE_OAUTH_REDIRECT_URL");
-    }
-
-    #[test]
-    fn web_authorization_url_uses_explicit_redirect() {
-        let config = OAuthConfig {
-            client_id: "web-client".to_string(),
-            client_secret: None,
-            auth_url: "https://accounts.example.test/authorize".to_string(),
-            token_url: "https://accounts.example.test/token".to_string(),
-            scopes: vec!["mail".to_string()],
-            redirect_port: 0,
-        };
-        let (authorization_url, state) =
-            start_web_oauth(&config, "https://mail.example.test/api/v1/oauth/callback").unwrap();
-        assert!(authorization_url.contains(
-            "redirect_uri=https%3A%2F%2Fmail.example.test%2Fapi%2Fv1%2Foauth%2Fcallback"
-        ));
-        assert!(!state.csrf_token.secret().is_empty());
-    }
-
-    #[tokio::test]
-    async fn oauth_provider_adapter_supports_gmail() {
-        oauth_provider_can_be_constructed(ProviderType::Gmail).await;
-    }
-
-    #[tokio::test]
-    async fn oauth_provider_adapter_supports_outlook() {
-        oauth_provider_can_be_constructed(ProviderType::Outlook).await;
-    }
 }

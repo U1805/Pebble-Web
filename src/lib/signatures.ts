@@ -1,4 +1,4 @@
-import { invoke } from "@/lib/platform";
+import { invoke } from "@tauri-apps/api/core";
 
 const LEGACY_STORAGE_KEY = "pebble-signatures";
 

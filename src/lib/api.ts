@@ -1,4 +1,4 @@
-import { invoke } from "@/lib/platform";
+import { invoke } from "@tauri-apps/api/core";
 
 // Re-export all IPC types so existing `import { Foo } from "@/lib/api"` keeps working.
 export type {

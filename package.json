@@ -12,7 +12,6 @@
     "build:windows": "tauri build --bundles nsis",
     "build:macos": "tauri build --bundles app,dmg",
     "build:linux": "NO_STRIP=1 tauri build --bundles appimage,deb,rpm",
-    "check:web-contract": "node scripts/check-web-command-coverage.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -16,14 +16,11 @@ async function bootstrap() {
   ]);
 
   void showMainWindow();
-  const { default: WebAuthGate } = await import("./app/WebAuthGate");
 
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <QueryClientProvider client={queryClient}>
-        <WebAuthGate>
-          <App />
-        </WebAuthGate>
+        <App />
       </QueryClientProvider>
     </StrictMode>,
   );

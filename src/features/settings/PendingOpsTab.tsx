@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@/lib/platform";
+import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Clock, RefreshCw, Trash2 } from "lucide-react";
 import type { PendingMailOp } from "@/lib/api";

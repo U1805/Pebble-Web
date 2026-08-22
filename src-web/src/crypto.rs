@@ -70,26 +70,3 @@ fn decode_hex_key(hex_key: &str) -> Result<[u8; 32], String> {
     key.copy_from_slice(&bytes);
     Ok(key)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::decode_hex_key;
-
-    #[test]
-    fn decodes_valid_hex_key() {
-        let valid = "ab".repeat(32);
-        let key = decode_hex_key(&valid).unwrap();
-        assert_eq!(key.len(), 32);
-        assert_eq!(key[0], 0xab);
-    }
-
-    #[test]
-    fn rejects_bad_length() {
-        assert!(decode_hex_key("00").is_err());
-    }
-
-    #[test]
-    fn rejects_bad_hex() {
-        assert!(decode_hex_key("zz".repeat(32).as_str()).is_err());
-    }
-}

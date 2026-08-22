@@ -22,7 +22,6 @@ import { useNotificationOpenNavigation } from "./useNotificationOpenNavigation";
 import { useCloseToBackground } from "./useCloseToBackground";
 import { useTrayI18n } from "./useTrayI18n";
 import { useMailtoOpen } from "./useMailtoOpen";
-import { useWebNotifications } from "./useWebNotifications";
 import AppBackground from "./AppBackground";
 
 const loadSettingsView = () => import("../features/settings/SettingsView");
@@ -52,7 +51,7 @@ const StarredView = lazy(loadStarredView);
 import { useTranslation } from "react-i18next";
 import i18next from "i18next";
 import { WifiOff } from "lucide-react";
-import { listen } from "@/lib/platform";
+import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { setNotificationsEnabled as setBackendNotificationsEnabled, syncTitlebarTheme } from "@/lib/api";
 
@@ -81,7 +80,6 @@ export default function Layout() {
   useRealtimeSyncTriggers();
   useNotificationOpenNavigation();
   useCloseToBackground();
-  useWebNotifications();
   useTrayI18n();
   useMailtoOpen();
 

@@ -1,6 +1,5 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { capabilities } from "@/lib/platform";
 import { useUIStore } from "@/stores/ui.store";
 import { startSync } from "@/lib/api";
 import { useAccountsQuery } from "@/hooks/queries";
@@ -11,8 +10,6 @@ export function useCloseToBackground() {
   const realtimeMode = useUIStore((s) => s.realtimeMode);
 
   useEffect(() => {
-    // Web：无窗口关闭概念（浏览器标签页由浏览器管理）
-    if (!capabilities.backgroundClose) return;
     const appWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     let disposed = false;
@@ -45,7 +42,6 @@ export function useCloseToBackground() {
 
   // Resume sync workers when window regains visibility after being hidden to tray
   useEffect(() => {
-    if (!capabilities.backgroundClose) return;
     const appWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     let disposed = false;

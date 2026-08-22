@@ -1,4 +1,4 @@
-import { invoke } from "@/lib/platform";
+import { invoke } from "@tauri-apps/api/core";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 type NamespaceResolver = () => Promise<string>;

@@ -1,0 +1,5 @@
+/* The browser owns window chrome. Keep the upstream TitleBar component intact
+ * and remove only its Web rendering at the platform boundary. */
+html[data-pebble-platform="web"] .app-shell > [data-tauri-drag-region] {
+  display: none !important;
+}

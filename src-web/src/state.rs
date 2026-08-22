@@ -8,7 +8,10 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;
 use crate::crypto;
-use crate::sync::SyncManager;
+use crate::sync_runtime::SyncManager;
+
+pub type KeyedLockRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+pub type OAuthAccountLockRegistry = KeyedLockRegistry;
 
 /// Web 服务共享状态。
 ///
@@ -20,6 +23,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub search: Arc<TantivySearch>,
     pub crypto: Arc<CryptoService>,
+    pub oauth_account_locks: OAuthAccountLockRegistry,
+    pub secure_user_data_locks: KeyedLockRegistry,
     pub attachments_dir: PathBuf,
     pub sync_manager: Arc<SyncManager>,
     pub ws_broadcast: broadcast::Sender<String>,
@@ -53,21 +58,26 @@ impl AppState {
         let crypto = Arc::new(crypto);
 
         let (ws_broadcast, _) = broadcast::channel(100);
+        let oauth_pending = Arc::new(Mutex::new(HashMap::new()));
+        let oauth_account_locks = Arc::new(Mutex::new(HashMap::new()));
+        let secure_user_data_locks = Arc::new(Mutex::new(HashMap::new()));
         let sync_manager = Arc::new(SyncManager::new(
             store.clone(),
             search.clone(),
             crypto.clone(),
+            oauth_account_locks.clone(),
             attachments_dir.clone(),
             sync_interval,
             ws_broadcast.clone(),
         ));
-        let oauth_pending = Arc::new(Mutex::new(HashMap::new()));
 
         Ok(Arc::new(Self {
             config,
             store,
             search,
             crypto,
+            oauth_account_locks,
+            secure_user_data_locks,
             attachments_dir,
             sync_manager,
             ws_broadcast,

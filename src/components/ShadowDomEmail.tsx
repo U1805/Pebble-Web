@@ -1,5 +1,5 @@
 import { useRef, useLayoutEffect } from "react";
-import { invoke } from "@/lib/platform";
+import { invoke } from "@tauri-apps/api/core";
 import { openMailtoUrl } from "@/app/useMailtoOpen";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 

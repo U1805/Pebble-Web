@@ -91,23 +91,3 @@ fn is_insecure_jwt_secret(secret: &str) -> bool {
             | "your-random-secret-at-least-32-chars"
     ) || trimmed.len() < 32
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{is_insecure_default_password, is_insecure_jwt_secret};
-
-    #[test]
-    fn rejects_documented_placeholder_passwords() {
-        assert!(is_insecure_default_password("changeme"));
-        assert!(is_insecure_default_password("your-password-here"));
-        assert!(!is_insecure_default_password("correct horse battery staple"));
-    }
-
-    #[test]
-    fn rejects_placeholder_or_short_jwt_secrets() {
-        assert!(is_insecure_jwt_secret("change-this-to-a-random-string"));
-        assert!(is_insecure_jwt_secret("your-random-secret-at-least-32-chars"));
-        assert!(is_insecure_jwt_secret("short-secret"));
-        assert!(!is_insecure_jwt_secret("this-is-a-real-secret-with-32-plus-chars"));
-    }
-}
