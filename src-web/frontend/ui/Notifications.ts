@@ -1,43 +1,42 @@
 import { useEffect } from "react";
-import { useTranslation } from "react-i18next";
 import { listen } from "../runtime/events";
 import { getWebNotificationsEnabled, showWebNotification } from "../runtime/notifications";
+import { WEB_NOTIFICATION_DISABLED_EVENT } from "../runtime/local-events";
+import { useUIStore } from "@/stores/ui.store";
 
-interface MailNewEventPayload {
-  account_id?: string;
-  message_id?: string;
-  thread_id?: string | null;
-  subject?: string;
-  from?: string;
+interface WebNotificationEventPayload {
+  title?: string;
+  body?: string;
+  account_id?: string | null;
+  message_id?: string | null;
 }
 
 export function useWebNotifications() {
-  const { t } = useTranslation();
-
   useEffect(() => {
-    const unlisteners: Array<() => void> = [];
+    const onDisabled = () => {
+      if (useUIStore.getState().notificationsEnabled) {
+        useUIStore.getState().setNotificationsEnabled(false);
+      }
+    };
+    window.addEventListener(WEB_NOTIFICATION_DISABLED_EVENT, onDisabled);
 
-    const newMail = listen<MailNewEventPayload>("mail:new", ({ payload }) => {
-      if (!getWebNotificationsEnabled()) return;
-      const body = payload.subject
-        ? (payload.from ? `${payload.from}: ${payload.subject}` : payload.subject)
-        : t("webNotifications.newMailBody", "A new message has arrived");
-      void showWebNotification(t("webNotifications.newMailTitle", "New mail"), body, {
-        account_id: payload.account_id,
-        message_id: payload.message_id,
-      });
-    });
-    unlisteners.push(() => { newMail.then((un) => un()).catch(() => {}); });
-
-    const error = listen<{ message?: string }>("mail:error", ({ payload }) => {
-      if (!getWebNotificationsEnabled()) return;
+    const notification = listen<WebNotificationEventPayload>("web:notification", ({ payload }) => {
+      if (!getWebNotificationsEnabled() || !payload.title) return;
       void showWebNotification(
-        t("webNotifications.syncErrorTitle", "Mail sync failed"),
-        payload.message ?? "",
+        payload.title,
+        payload.body ?? "",
+        payload.message_id
+          ? {
+              account_id: payload.account_id ?? undefined,
+              message_id: payload.message_id,
+            }
+          : undefined,
       );
     });
-    unlisteners.push(() => { error.then((un) => un()).catch(() => {}); });
 
-    return () => { unlisteners.forEach((un) => un()); };
-  }, [t]);
+    return () => {
+      window.removeEventListener(WEB_NOTIFICATION_DISABLED_EVENT, onDisabled);
+      notification.then((un) => un()).catch(() => {});
+    };
+  }, []);
 }

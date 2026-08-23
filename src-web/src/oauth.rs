@@ -7,44 +7,33 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
+    Json,
 };
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     Scope, TokenResponse, TokenUrl,
 };
-use pebble_core::{new_id, now_timestamp, Account, HttpProxyConfig, PebbleError, ProviderType};
+use pebble_core::{
+    new_id, now_timestamp, Account, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType,
+};
 use pebble_oauth::{
-    build_http_client, OAuthConfig, OAuthManager, OAuthNetworkConfig, PkceState, TokenPair,
+    build_http_client, OAuthConfig, OAuthNetworkConfig, PkceState, TokenPair,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use url::Url;
 
 use crate::account_colors::default_account_color;
-use crate::commands::network::AccountProxyMode;
 use crate::commands::network;
 use crate::blocking::run_blocking;
-use crate::commands::encrypted_store;
 use crate::error::ApiError;
-use crate::state::{AppStateRef, OAuthAccountLockRegistry};
+use crate::state::AppStateRef;
 
-const PENDING_OAUTH_TTL_SECS: i64 = 10 * 60;
+const PENDING_OAUTH_TTL_SECS: i64 = 5 * 60;
+const OAUTH_TERMINAL_STATUS_RETENTION_SECS: i64 = 10 * 60;
 const CALLBACK_PATH: &str = "/api/v1/oauth/callback";
-
-async fn oauth_account_lock(
-    registry: &OAuthAccountLockRegistry,
-    account_id: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = registry.lock().await;
-    Arc::clone(
-        locks
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-    )
-}
 
 fn parse_web_oauth_urls(
     config: &OAuthConfig,
@@ -94,6 +83,19 @@ fn start_web_oauth(
             csrf_token,
         },
     ))
+}
+
+fn token_exchange_error_message(provider: &str, detail: &str) -> String {
+    let detail_lower = detail.to_ascii_lowercase();
+    if detail_lower.contains("client_secret is missing") {
+        if provider.eq_ignore_ascii_case("outlook") {
+            return "Token exchange failed: Microsoft rejected this OAuth app because it requires a client secret. Set MICROSOFT_CLIENT_SECRET in .env and restart Pebble Web.".to_string();
+        }
+        if provider.eq_ignore_ascii_case("gmail") {
+            return "Token exchange failed: Google rejected this OAuth app because it requires a client secret. Set GOOGLE_CLIENT_SECRET in .env and restart Pebble Web.".to_string();
+        }
+    }
+    format!("Token exchange failed: {detail}")
 }
 
 async fn complete_web_oauth(
@@ -173,181 +175,10 @@ pub(crate) struct PendingOAuth {
     pub(crate) created_at: i64,
 }
 
-/// Decrypted OAuth material used only while constructing a mail provider.
-/// The access/refresh tokens are never serialized into a response.
-pub(crate) struct OAuthAccess {
-    pub(crate) access_token: String,
-    pub(crate) refresh_token: Option<String>,
-    pub(crate) expires_at: Option<i64>,
-    pub(crate) proxy: Option<HttpProxyConfig>,
-}
-
-pub(crate) fn load_oauth_access(
-    crypto: &pebble_crypto::CryptoService,
-    store: &pebble_store::Store,
-    account_id: &str,
-) -> Result<OAuthAccess, PebbleError> {
-    let bytes = encrypted_store::load_account_auth_data(crypto, store, account_id)?
-        .ok_or_else(|| PebbleError::Auth(format!("No OAuth auth data for account {account_id}")))?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| PebbleError::Auth(format!("Invalid OAuth auth data: {e}")))?;
-    let access_token = value["access_token"]
-        .as_str()
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| PebbleError::Auth("OAuth access token is missing".to_string()))?
-        .to_string();
-    let refresh_token = value["refresh_token"].as_str().map(ToOwned::to_owned);
-    let expires_at = value["expires_at"].as_i64();
-    let stored_proxy = value
-        .get("proxy")
-        .filter(|proxy| !proxy.is_null())
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| PebbleError::Auth(format!("Invalid OAuth proxy config: {e}")))?;
-    let mode = value
-        .get("proxy_mode")
-        .and_then(|mode| serde_json::from_value(mode.clone()).ok())
-        .unwrap_or(AccountProxyMode::Inherit);
-    let proxy = match mode {
-        AccountProxyMode::Disabled => None,
-        AccountProxyMode::Custom => stored_proxy,
-        AccountProxyMode::Inherit => stored_proxy.or(network::get_global_proxy_raw(crypto, store)?),
-    };
-    Ok(OAuthAccess {
-        access_token,
-        refresh_token,
-        expires_at,
-        proxy,
-    })
-}
-
-/// Construct a shared Gmail/Outlook provider with the account's effective
-/// proxy and a refreshed access token when the stored token is near expiry.
-/// Keeping this adapter in `src-web` avoids adding Web transport concerns to
-/// the shared OAuth crate.
-pub(crate) async fn load_oauth_provider(
-    state: &AppStateRef,
-    account: &Account,
-) -> Result<Arc<dyn pebble_core::traits::MailProvider>, PebbleError> {
-    let access = load_oauth_access(&state.crypto, &state.store, &account.id)?;
-    let provider_name = match account.provider {
-        ProviderType::Gmail => "gmail",
-        ProviderType::Outlook => "outlook",
-        _ => {
-            return Err(PebbleError::UnsupportedProvider(
-                "OAuth provider is required".to_string(),
-            ))
-        }
-    };
-
-    let mut access_token = access.access_token.clone();
-    if access
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now_timestamp() + 60)
-    {
-        if let Some(refresher) = build_oauth_token_refresher(
-            state.crypto.clone(),
-            state.store.clone(),
-            provider_name,
-            &access,
-            state.oauth_account_locks.clone(),
-            &account.id,
-        )? {
-            let (refreshed, _) = refresher().await?;
-            access_token = refreshed;
-        }
-    }
-
-    let credentials = match access.proxy {
-        Some(proxy) => json!({
-            "access_token": access_token,
-            "proxy": proxy,
-        }),
-        None => json!({"access_token": access_token}),
-    };
-    pebble_mail::provider::create_provider(&account.provider, &credentials, &account.id).await
-}
-
-/// Build the refresh closure expected by Gmail/Outlook sync workers. The
-/// closure re-reads the encrypted JSON and updates only token fields, so a
-/// concurrent proxy preference update is not overwritten.
-pub(crate) fn build_oauth_token_refresher(
-    crypto: Arc<pebble_crypto::CryptoService>,
-    store: Arc<pebble_store::Store>,
-    provider: &str,
-    access: &OAuthAccess,
-    account_locks: OAuthAccountLockRegistry,
-    account_id: &str,
-) -> Result<Option<pebble_mail::gmail_sync::TokenRefresher>, PebbleError> {
-    let Some(initial_refresh_token) = access.refresh_token.clone() else {
-        return Ok(None);
-    };
-    let config = oauth_config_for_provider(provider).map_err(PebbleError::Auth)?;
-    let account_id = account_id.to_string();
-    Ok(Some(Box::new(move || {
-        let config = config.clone();
-        let initial_refresh_token = initial_refresh_token.clone();
-        let crypto = crypto.clone();
-        let store = store.clone();
-        let account_locks = account_locks.clone();
-        let account_id = account_id.clone();
-        Box::pin(async move {
-            let account_lock = oauth_account_lock(&account_locks, &account_id).await;
-            let _account_guard = account_lock.lock().await;
-
-            // Re-read the latest encrypted auth blob after taking the per-account lock.
-            // Providers can rotate refresh tokens, so a token captured before another
-            // refresh completed must not overwrite the newer value.
-            let existing = encrypted_store::load_account_auth_data(&crypto, &store, &account_id)?
-                .ok_or_else(|| {
-                    PebbleError::Auth("OAuth auth data disappeared during refresh".to_string())
-                })?;
-            let mut value: Value = serde_json::from_slice(&existing)
-                .map_err(|e| PebbleError::Auth(format!("Invalid OAuth auth data: {e}")))?;
-            let refresh_token = value["refresh_token"]
-                .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or(initial_refresh_token);
-
-            let current_access = load_oauth_access(&crypto, &store, &account_id)?;
-            let manager = OAuthManager::new_with_network(
-                config,
-                OAuthNetworkConfig {
-                    proxy: current_access.proxy,
-                },
-            );
-            let token_pair = manager
-                .refresh_token(&refresh_token)
-                .await
-                .map_err(|e| PebbleError::Auth(format!("OAuth token refresh failed: {e}")))?;
-
-            value["access_token"] = Value::String(token_pair.access_token.clone());
-            value["refresh_token"] = token_pair
-                .refresh_token
-                .clone()
-                .map(Value::String)
-                .unwrap_or_else(|| Value::String(refresh_token));
-            value["expires_at"] = token_pair
-                .expires_at
-                .map(Value::from)
-                .unwrap_or(Value::Null);
-            value["scopes"] = serde_json::to_value(&token_pair.scopes)
-                .map_err(|e| PebbleError::Internal(e.to_string()))?;
-            let bytes =
-                serde_json::to_vec(&value).map_err(|e| PebbleError::Internal(e.to_string()))?;
-            encrypted_store::store_account_auth_data(&crypto, &store, &account_id, &bytes)?;
-            Ok((token_pair.access_token, token_pair.expires_at))
-        })
-    })))
-}
-
 #[derive(Deserialize)]
 struct StartOAuthArgs {
     provider: String,
-    #[serde(default)]
     email: String,
-    #[serde(default)]
     display_name: String,
     #[serde(default)]
     proxy_host: Option<String>,
@@ -360,7 +191,111 @@ pub(crate) struct OAuthCallbackQuery {
     pub(crate) state: Option<String>,
     pub(crate) code: Option<String>,
     pub(crate) error: Option<String>,
-    pub(crate) error_description: Option<String>,
+    #[serde(rename = "error_description")]
+    pub(crate) _error_description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OAuthFlowStatus {
+    Processing { updated_at: i64 },
+    Success { account: Account, updated_at: i64 },
+    Error { message: String, updated_at: i64 },
+}
+
+impl OAuthFlowStatus {
+    fn updated_at(&self) -> i64 {
+        match self {
+            Self::Processing { updated_at }
+            | Self::Success { updated_at, .. }
+            | Self::Error { updated_at, .. } => *updated_at,
+        }
+    }
+
+    fn is_processing(&self) -> bool {
+        matches!(self, Self::Processing { .. })
+    }
+
+    fn response_json(&self) -> Value {
+        match self {
+            Self::Processing { .. } => json!({ "status": "processing" }),
+            Self::Success { account, .. } => json!({ "status": "success", "account": account }),
+            Self::Error { message, .. } => json!({ "status": "error", "message": message }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OAuthCallbackStatusArgs {
+    state: String,
+    #[serde(default)]
+    cancel_pending: bool,
+}
+
+async fn set_oauth_flow_status(state: &AppStateRef, state_key: &str, status: OAuthFlowStatus) {
+    state
+        .oauth_flow_status
+        .lock()
+        .await
+        .insert(state_key.to_string(), status);
+}
+
+async fn callback_page_flow_error(
+    state: &AppStateRef,
+    state_key: &str,
+    message: String,
+) -> Response {
+    set_oauth_flow_status(
+        state,
+        state_key,
+        OAuthFlowStatus::Error {
+            message: message.clone(),
+            updated_at: now_timestamp(),
+        },
+    )
+    .await;
+    callback_page_error(&message)
+}
+
+/// Report the server-side state of a browser OAuth flow. The opener uses this
+/// at the 5-minute redirect boundary and after an early popup close so command
+/// completion follows the server result instead of the popup lifetime.
+pub(crate) async fn oauth_callback_status(
+    State(state): State<AppStateRef>,
+    headers: HeaderMap,
+    Json(args): Json<OAuthCallbackStatusArgs>,
+) -> Result<Json<Value>, ApiError> {
+    crate::auth::require_auth(&state, &headers)?;
+    let state_key = args.state.trim();
+    if state_key.is_empty() {
+        return Err(ApiError::BadRequest("OAuth callback status requires state".to_string()));
+    }
+    let now = now_timestamp();
+    {
+        let mut pending = state.oauth_pending.lock().await;
+        match pending.get(state_key).map(|flow| flow.created_at) {
+            Some(created_at) if created_at + PENDING_OAUTH_TTL_SECS > now => {
+                if args.cancel_pending {
+                    pending.remove(state_key);
+                    return Ok(Json(json!({ "status": "expired" })));
+                }
+                return Ok(Json(json!({ "status": "pending" })));
+            }
+            Some(_) => {
+                pending.remove(state_key);
+            }
+            None => {}
+        }
+    }
+
+    let mut statuses = state.oauth_flow_status.lock().await;
+    statuses.retain(|_, status| {
+        status.is_processing()
+            || status.updated_at() + OAUTH_TERMINAL_STATUS_RETENTION_SECS > now
+    });
+    if let Some(status) = statuses.get(state_key) {
+        return Ok(Json(status.response_json()));
+    }
+    Ok(Json(json!({ "status": "expired" })))
 }
 
 /// Begin an OAuth transaction. The frontend opens the returned URL in a
@@ -384,8 +319,15 @@ pub(crate) async fn start_oauth_flow(state: AppStateRef, args: Value) -> Result<
         .map_err(|e| ApiError::BadRequest(format!("failed to start {provider} OAuth: {e}")))?;
     let state_key = pkce_state.csrf_token.secret().to_string();
 
-    let mut pending = state.oauth_pending.lock().await;
     let now = now_timestamp();
+    {
+        let mut statuses = state.oauth_flow_status.lock().await;
+        statuses.retain(|_, status| {
+            status.is_processing()
+                || status.updated_at() + OAUTH_TERMINAL_STATUS_RETENTION_SECS > now
+        });
+    }
+    let mut pending = state.oauth_pending.lock().await;
     pending.retain(|_, item| item.created_at + PENDING_OAUTH_TTL_SECS > now);
     pending.insert(
         state_key,
@@ -412,9 +354,10 @@ pub(crate) async fn oauth_callback(
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
     let Some(state_key) = query.state.as_deref().filter(|value| !value.is_empty()) else {
-        return callback_page_error("OAuth callback is missing state");
+        return callback_page_error("OAuth redirect failed: Authorization callback missing state");
     };
-    let pending = state.oauth_pending.lock().await.remove(state_key);
+    let mut pending_guard = state.oauth_pending.lock().await;
+    let pending = pending_guard.remove(state_key);
     let Some(mut pending) = pending else {
         return callback_page_error("OAuth state is invalid, expired, or already used");
     };
@@ -426,21 +369,39 @@ pub(crate) async fn oauth_callback(
     {
         return callback_page_error("OAuth state is invalid or expired");
     }
+    set_oauth_flow_status(
+        &state,
+        state_key,
+        OAuthFlowStatus::Processing {
+            updated_at: now_timestamp(),
+        },
+    )
+    .await;
+    drop(pending_guard);
     if let Some(error) = query.error.as_deref() {
-        let detail = query
-            .error_description
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|description| format!(" ({description})"))
-            .unwrap_or_default();
-        return callback_page_error(&format!("OAuth authorization was denied: {error}{detail}"));
+        return callback_page_flow_error(
+            &state,
+            state_key,
+            format!("OAuth redirect failed: Authorization denied or missing code: {error}"),
+        )
+        .await;
     }
     let Some(code) = query.code.as_deref().filter(|value| !value.is_empty()) else {
-        return callback_page_error("OAuth callback is missing authorization code");
+        return callback_page_flow_error(
+            &state,
+            state_key,
+            "OAuth redirect failed: Authorization denied or missing code: unknown".to_string(),
+        )
+        .await;
     };
 
     let Some(pkce_state) = pending.pkce_state.take() else {
-        return callback_page_error("OAuth state is invalid or already used");
+        return callback_page_flow_error(
+            &state,
+            state_key,
+            "OAuth state is invalid or already used".to_string(),
+        )
+        .await;
     };
     let tokens = match complete_web_oauth(
         &pending.config,
@@ -452,7 +413,14 @@ pub(crate) async fn oauth_callback(
     .await
     {
         Ok(tokens) => tokens,
-        Err(error) => return callback_page_error(&format!("OAuth token exchange failed: {error}")),
+        Err(error) => {
+            return callback_page_flow_error(
+                &state,
+                state_key,
+                token_exchange_error_message(&pending.provider, &error),
+            )
+            .await;
+        }
     };
     let identity =
         match fetch_userinfo(&pending.provider, &tokens.access_token, &pending.network).await {
@@ -460,20 +428,26 @@ pub(crate) async fn oauth_callback(
             Err(_error) if pending.provider == "gmail" => {
                 (pending.email.clone(), pending.display_name.clone())
             }
-            Err(error) => return callback_page_error(&error),
+            Err(error) => {
+                return callback_page_flow_error(&state, state_key, error).await;
+            }
         };
 
     let account = match persist_oauth_account(&state, &pending, &tokens, identity).await {
         Ok(account) => account,
-        Err(error) => return callback_page_error(&error),
-    };
-    let sync = state.sync_manager.clone();
-    let account_for_sync = account.clone();
-    tokio::spawn(async move {
-        if let Err(error) = sync.sync_account(&account_for_sync).await {
-            tracing::warn!(account_id = %account_for_sync.id, "initial OAuth sync failed: {error}");
+        Err(error) => {
+            return callback_page_flow_error(&state, state_key, error).await;
         }
-    });
+    };
+    set_oauth_flow_status(
+        &state,
+        state_key,
+        OAuthFlowStatus::Success {
+            account: account.clone(),
+            updated_at: now_timestamp(),
+        },
+    )
+    .await;
     callback_page_success(&account)
 }
 
@@ -495,35 +469,40 @@ async fn persist_oauth_account(
         identity.1
     };
     let account_proxy = pending.account_proxy.clone();
-    let token_json = json!({
-        "access_token": tokens.access_token,
-        "refresh_token": tokens.refresh_token,
-        "expires_at": tokens.expires_at,
-        "scopes": tokens.scopes,
-        "proxy_mode": if account_proxy.is_some() { "custom" } else { "inherit" },
-        "proxy": account_proxy,
-    });
+    let oauth_tokens = OAuthTokens {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
+        expires_at: tokens.expires_at,
+        scopes: tokens.scopes.clone(),
+    };
     let store = state.store.clone();
     let crypto = state.crypto.clone();
     let provider_type = provider_type(&provider).map_err(|e| e.to_string())?;
     run_blocking(move || {
         let accounts = store.list_accounts()?;
         let now = now_timestamp();
+        let color = Some(default_account_color(&accounts, &email));
         let account = Account {
             id: new_id(),
             email,
             display_name,
-            color: Some(default_account_color(&accounts, &provider)),
+            color,
             provider: provider_type,
             created_at: now,
             updated_at: now,
         };
         store.insert_account(&account)?;
         let result = (|| -> Result<(), PebbleError> {
-            let bytes = serde_json::to_vec(&token_json).map_err(|e| {
-                PebbleError::Internal(format!("failed to serialize OAuth auth data: {e}"))
-            })?;
-            encrypted_store::store_account_auth_data(&crypto, &store, &account.id, &bytes)?;
+            let stored = crate::commands::oauth::StoredOAuthAuthData::from_tokens(
+                oauth_tokens,
+                account_proxy,
+            );
+            crate::commands::oauth::persist_stored_oauth_auth_data_raw(
+                &crypto,
+                &store,
+                &account.id,
+                &stored,
+            )?;
             store.update_sync_state(&account.id, |sync_state| {
                 sync_state.provider = Some(provider.clone());
             })?;
@@ -539,6 +518,13 @@ async fn persist_oauth_account(
     .map_err(|error| format!("OAuth account persistence failed: {error:?}"))
 }
 
+fn non_empty_json_string<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value[field]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn fetch_userinfo(
     provider: &str,
     access_token: &str,
@@ -551,43 +537,42 @@ async fn fetch_userinfo(
         }
         _ => return Err(format!("unsupported OAuth provider: {provider}")),
     };
-    let client = build_http_client(network).map_err(|e| e.to_string())?;
+    let client = build_http_client(network)
+        .map_err(|e| format!("Userinfo HTTP client failed: {e}"))?;
     let value: Value = client
         .get(url)
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|e| format!("OAuth user profile request failed: {e}"))?
+        .map_err(|e| format!("Userinfo request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("OAuth user profile request failed: {e}"))?
+        .map_err(|e| format!("Userinfo request failed: {e}"))?
         .json()
         .await
-        .map_err(|e| format!("OAuth user profile response was invalid: {e}"))?;
-    let email = if provider == "outlook" {
-        value["mail"]
-            .as_str()
-            .or_else(|| value["userPrincipalName"].as_str())
-    } else {
-        value["email"].as_str()
+        .map_err(|e| format!("Userinfo parse failed: {e}"))?;
+    let email = match provider {
+        "gmail" => non_empty_json_string(&value, "email"),
+        "outlook" => non_empty_json_string(&value, "mail")
+            .or_else(|| non_empty_json_string(&value, "userPrincipalName")),
+        _ => None,
     }
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .ok_or_else(|| "OAuth user profile did not include a mailbox address".to_string())?;
-    let name = value["displayName"]
-        .as_str()
-        .or_else(|| value["name"].as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    Ok((email.to_string(), name))
+    .ok_or_else(|| format!("{provider} user profile did not include a mailbox address"))?;
+    let name = match provider {
+        "outlook" => non_empty_json_string(&value, "displayName")
+            .or_else(|| non_empty_json_string(&value, "name")),
+        _ => non_empty_json_string(&value, "name")
+            .or_else(|| non_empty_json_string(&value, "displayName")),
+    }
+    .unwrap_or_default();
+    Ok((email.to_string(), name.to_string()))
 }
 
 fn normalize_provider(provider: &str) -> Result<String, String> {
-    let provider = provider.trim().to_ascii_lowercase();
-    if matches!(provider.as_str(), "gmail" | "outlook") {
-        Ok(provider)
+    let normalized = provider.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "gmail" | "outlook") {
+        Ok(normalized)
     } else {
-        Err(format!("unsupported OAuth provider: {provider}"))
+        Err(format!("Unknown OAuth provider: {provider}"))
     }
 }
 
@@ -599,53 +584,161 @@ fn provider_type(provider: &str) -> Result<ProviderType, PebbleError> {
     }
 }
 
-fn oauth_config_for_provider(provider: &str) -> Result<OAuthConfig, String> {
-    let (client_id_key, client_secret_key, auth_url, token_url, scopes) = match provider {
-        "gmail" => (
+fn dotenv_lookup_from_str(contents: &str, key: &str) -> Option<String> {
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        return Some(unquoted.to_string());
+    }
+    None
+}
+
+fn dotenv_contents() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join(".env"));
+        candidates.push(current_dir.join("..").join(".env"));
+    }
+    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"));
+    candidates.push(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".env"),
+    );
+
+    candidates
+        .into_iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
+fn web_config_value_from_sources(
+    key: &str,
+    env_value: Option<&str>,
+    dotenv_contents: Option<&str>,
+    compile_value: Option<&str>,
+    placeholder: &str,
+) -> String {
+    env_value
+        .filter(|value| !is_placeholder(value))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            dotenv_contents
+                .and_then(|contents| dotenv_lookup_from_str(contents, key))
+                .filter(|value| !is_placeholder(value))
+        })
+        .or_else(|| {
+            compile_value
+                .filter(|value| !is_placeholder(value))
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| placeholder.to_string())
+}
+
+fn web_config_value(key: &str, compile_value: Option<&str>, placeholder: &str) -> String {
+    let env_value = std::env::var(key).ok();
+    let dotenv = dotenv_contents();
+    web_config_value_from_sources(
+        key,
+        env_value.as_deref(),
+        dotenv.as_deref(),
+        compile_value,
+        placeholder,
+    )
+}
+
+fn web_config_optional_value(key: &str, compile_value: Option<&str>) -> Option<String> {
+    let value = web_config_value(key, compile_value, "");
+    if is_placeholder(&value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub(crate) fn gmail_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: web_config_value(
             "GOOGLE_CLIENT_ID",
+            option_env!("GOOGLE_CLIENT_ID"),
+            "GOOGLE_CLIENT_ID_PLACEHOLDER",
+        ),
+        client_secret: web_config_optional_value(
             "GOOGLE_CLIENT_SECRET",
-            "https://accounts.google.com/o/oauth2/v2/auth",
-            "https://oauth2.googleapis.com/token",
-            vec![
-                "https://mail.google.com/".to_string(),
-                "https://www.googleapis.com/auth/userinfo.email".to_string(),
-                "https://www.googleapis.com/auth/userinfo.profile".to_string(),
-            ],
+            option_env!("GOOGLE_CLIENT_SECRET"),
         ),
-        "outlook" => (
+        auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+        token_url: "https://oauth2.googleapis.com/token".to_string(),
+        scopes: vec![
+            "https://mail.google.com/".to_string(),
+            "https://www.googleapis.com/auth/userinfo.email".to_string(),
+            "https://www.googleapis.com/auth/userinfo.profile".to_string(),
+        ],
+        redirect_port: 0,
+    }
+}
+
+pub(crate) fn outlook_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: web_config_value(
             "MICROSOFT_CLIENT_ID",
-            "MICROSOFT_CLIENT_SECRET",
-            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            vec![
-                "https://graph.microsoft.com/Mail.ReadWrite".to_string(),
-                "https://graph.microsoft.com/Mail.Send".to_string(),
-                "https://graph.microsoft.com/User.Read".to_string(),
-                "offline_access".to_string(),
-            ],
+            option_env!("MICROSOFT_CLIENT_ID"),
+            "MICROSOFT_CLIENT_ID_PLACEHOLDER",
         ),
+        client_secret: web_config_optional_value(
+            "MICROSOFT_CLIENT_SECRET",
+            option_env!("MICROSOFT_CLIENT_SECRET"),
+        ),
+        auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
+        token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
+        scopes: vec![
+            "https://graph.microsoft.com/Mail.ReadWrite".to_string(),
+            "https://graph.microsoft.com/Mail.Send".to_string(),
+            "https://graph.microsoft.com/User.Read".to_string(),
+            "offline_access".to_string(),
+        ],
+        redirect_port: 0,
+    }
+}
+
+fn oauth_config_for_provider(provider: &str) -> Result<OAuthConfig, String> {
+    let config = match provider {
+        "gmail" => gmail_oauth_config(),
+        "outlook" => outlook_oauth_config(),
         _ => return Err(format!("unsupported OAuth provider: {provider}")),
     };
-    let client_id = std::env::var(client_id_key).unwrap_or_default();
-    if is_placeholder(&client_id) {
-        return Err(format!("{client_id_key} is not configured"));
+    if is_placeholder(&config.client_id) {
+        return Err(format!(
+            "OAuth client_id for '{provider}' is not configured. Set the appropriate environment variable before starting the OAuth flow."
+        ));
     }
-    let client_secret = std::env::var(client_secret_key)
-        .ok()
-        .filter(|value| !is_placeholder(value));
-    Ok(OAuthConfig {
-        client_id,
-        client_secret,
-        auth_url: auth_url.to_string(),
-        token_url: token_url.to_string(),
-        scopes,
-        redirect_port: 0,
-    })
+    Ok(config)
 }
 
 fn oauth_redirect_url() -> Result<String, String> {
-    let value = std::env::var("PEBBLE_OAUTH_REDIRECT_URL")
-        .map_err(|_| "PEBBLE_OAUTH_REDIRECT_URL is required for Web OAuth".to_string())?;
+    let value = web_config_value(
+        "PEBBLE_OAUTH_REDIRECT_URL",
+        option_env!("PEBBLE_OAUTH_REDIRECT_URL"),
+        "",
+    );
+    if value.trim().is_empty() {
+        return Err("PEBBLE_OAUTH_REDIRECT_URL is required for Web OAuth".to_string());
+    }
     let url = Url::parse(&value).map_err(|e| format!("invalid PEBBLE_OAUTH_REDIRECT_URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err("PEBBLE_OAUTH_REDIRECT_URL must be an absolute HTTP(S) URL".to_string());

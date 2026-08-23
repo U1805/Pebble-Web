@@ -1,84 +1,84 @@
-use std::time::Duration;
-
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-/// 更新检查源：个人 Pebble Web fork 的 GitHub Release。
-///（Web 端"更新"= 有新版本 pebble-web fork 发布；桌面端指向上游 Pebble release）
-const UPDATE_REPO: &str = "U1805/Pebble-Web";
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    pub latest_version: String,
+    pub release_url: String,
+    pub is_newer: bool,
+}
 
-/// 查询 GitHub Releases 最新版本，与当前运行版本比较。
-/// 返回结构对齐桌面端 AboutTab 的 check_for_update 期望。
-pub async fn check_for_update(_state: AppStateRef, _args: Value) -> Result<Value, ApiError> {
-    let current = env!("CARGO_PKG_VERSION");
-    let current_v =
-        semver::Version::parse(current).unwrap_or_else(|_| semver::Version::new(0, 0, 0));
+/// Web uses server-side HTTP instead of the desktop process, but the update
+/// source and comparison semantics intentionally match the Tauri command.
+pub async fn check_for_update(_state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        current_version: String,
+    }
+    let args: Args = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid check_for_update args: {e}")))?;
 
-    let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .user_agent("Pebble-Email-Client")
         .build()
-        .map_err(|e| ApiError::Internal(format!("failed to build http client: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to create HTTP client: {e}")))?;
 
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "pebble-web")
-        .header("Accept", "application/vnd.github+json")
+    let response = client
+        .get("https://api.github.com/repos/QingJ01/Pebble/releases/latest")
+        .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("update check request failed: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to check for updates: {e}")))?;
 
-    if !resp.status().is_success() {
-        // GitHub 对无 release 的仓库返回 404：视为「无可用更新」，不向用户报错
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(
-                json!({ "latest_version": "", "release_url": format!("https://github.com/{UPDATE_REPO}/releases"), "is_newer": false }),
-            );
-        }
+    if !response.status().is_success() {
         return Err(ApiError::Internal(format!(
-            "update check failed: HTTP {}",
-            resp.status()
+            "GitHub API returned status {}",
+            response.status()
         )));
     }
 
-    let body: serde_json::Value = resp
+    let data: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| ApiError::Internal(format!("update check response invalid: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to parse response: {e}")))?;
 
-    let latest = body["tag_name"]
+    let tag = data["tag_name"]
         .as_str()
-        .unwrap_or("")
-        .trim_start_matches('v')
-        .to_string();
-    let release_url = body["html_url"]
+        .ok_or_else(|| ApiError::Internal("Missing tag_name in response".to_string()))?;
+    let latest = tag.trim_start_matches('v').to_string();
+    let release_url = data["html_url"]
         .as_str()
-        .unwrap_or(&format!("https://github.com/{UPDATE_REPO}/releases"))
+        .unwrap_or("https://github.com/QingJ01/Pebble/releases")
         .to_string();
 
-    let is_newer = semver::Version::parse(&latest)
-        .map(|v| v > current_v)
-        .unwrap_or(false);
+    let is_newer = match (
+        semver::Version::parse(&latest),
+        semver::Version::parse(&args.current_version),
+    ) {
+        (Ok(latest_version), Ok(current_version)) => latest_version > current_version,
+        _ => latest != args.current_version,
+    };
 
-    Ok(json!({
-        "latest_version": latest,
-        "release_url": release_url,
-        "is_newer": is_newer,
-    }))
+    serde_json::to_value(UpdateInfo {
+        latest_version: latest,
+        release_url,
+        is_newer,
+    })
+    .map_err(ApiError::from_serialize)
 }
 
-/// Shared command health check. The HTTP health endpoint remains in commands/mod.rs.
+/// Shared command health check. The HTTP health endpoint remains available for
+/// container/runtime health probes.
 pub async fn health_check_command(state: AppStateRef) -> Result<Value, ApiError> {
-    let store = state.store.clone();
-    let message = crate::blocking::run_blocking(move || {
-        let accounts = store.list_accounts()?;
-        Ok(format!(
-            "Pebble is healthy. {} account(s) configured.",
-            accounts.len()
-        ))
-    })
-    .await?;
-    Ok(Value::String(message))
+    let accounts = state
+        .store
+        .list_accounts()
+        .map_err(|e| ApiError::Internal(format!("Health check failed: {e}")))?;
+    Ok(Value::String(format!(
+        "Pebble is healthy. {} account(s) configured.",
+        accounts.len()
+    )))
 }

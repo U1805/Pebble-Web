@@ -37,20 +37,32 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// 核心 crate 错误 → 传输层错误。
-    /// Validation/Auth 类错误保留 message（前端需要具体原因），其余记日志并转 500。
+    /// 核心 crate 错误 → Web transport 错误。
+    ///
+    /// Tauri 直接序列化 `PebbleError`，共享前端读取其中的 `message` 字段。
+    /// Web 可以使用不同 HTTP 状态码，但必须保留同一个原始 message。
     pub fn from_pebble(err: PebbleError) -> Self {
         match err {
-            PebbleError::Validation(msg) => {
-                ApiError::BadRequest(format!("INVALID_ARGUMENT: {msg}"))
-            }
-            PebbleError::Auth(msg) | PebbleError::OAuth(msg) => ApiError::Unauthorized(msg),
-            PebbleError::UnsupportedProvider(msg) => {
-                ApiError::BadRequest(format!("UNSUPPORTED_PROVIDER: {msg}"))
-            }
-            other => {
-                tracing::error!(%other, "core error");
-                ApiError::Internal(other.to_string())
+            // Mail-provider authentication is a command/business failure, not a
+            // Pebble Web session failure. HTTP 401 is reserved for the Web login
+            // token so the frontend does not log the user out when an IMAP/OAuth
+            // account needs re-authentication.
+            PebbleError::Validation(msg)
+            | PebbleError::Auth(msg)
+            | PebbleError::OAuth(msg)
+            | PebbleError::UnsupportedProvider(msg) => ApiError::BadRequest(msg),
+            PebbleError::Network(msg)
+            | PebbleError::Storage(msg)
+            | PebbleError::Sync(msg)
+            | PebbleError::SyncCursorExpired(msg)
+            | PebbleError::Rule(msg)
+            | PebbleError::Translate(msg)
+            | PebbleError::Privacy(msg)
+            | PebbleError::Internal(msg)
+            | PebbleError::TokenExpired(msg)
+            | PebbleError::TokenRefreshFailed(msg) => {
+                tracing::error!(message = %msg, "core error");
+                ApiError::Internal(msg)
             }
         }
     }

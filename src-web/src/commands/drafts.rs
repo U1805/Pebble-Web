@@ -1,168 +1,114 @@
-use pebble_core::{new_id, now_timestamp, EmailAddress, FolderRole, Message, PebbleError};
-use serde::Deserialize;
-use serde_json::Value;
-
-use crate::commands::attachments::{
-    cleanup_local_attachment_records, stage_local_attachment_records,
-    validate_staged_attachment_paths,
+use crate::state::{AppState, AppStateRef};
+use pebble_core::{
+    traits::DraftProvider, DraftMessage, EmailAddress, FolderRole, PebbleError, ProviderType,
 };
-use crate::blocking::run_blocking;
-use crate::error::ApiError;
-use crate::state::AppStateRef;
+use tracing::warn;
 
-#[derive(Deserialize)]
-struct SaveDraftArgs {
-    account_id: String,
-    to: Vec<String>,
-    #[serde(default)]
-    cc: Vec<String>,
-    #[serde(default)]
-    bcc: Vec<String>,
-    #[serde(default)]
-    subject: String,
-    #[serde(default)]
-    body_text: String,
-    #[serde(default)]
-    body_html: Option<String>,
-    #[serde(default)]
-    in_reply_to: Option<String>,
-    #[serde(default)]
-    attachment_paths: Option<Vec<String>>,
-    #[serde(default)]
-    existing_draft_id: Option<String>,
+use super::attachments::{cleanup_local_attachment_records, stage_local_attachment_records, validate_staged_attachment_paths};
+use super::messages::provider_dispatch::ConnectedProvider;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftProvenance {
+    local_id: Option<String>,
+    remote_id: Option<String>,
 }
 
-fn parse_recipients(addresses: &[String]) -> Vec<EmailAddress> {
-    addresses
-        .iter()
-        .cloned()
-        .map(|address| EmailAddress {
-            name: None,
-            address,
-        })
-        .collect()
+trait RemoteDraftOperations {
+    async fn create_draft(&self, draft: &DraftMessage) -> Result<String, PebbleError>;
+    async fn update_draft(&self, draft_id: &str, draft: &DraftMessage) -> Result<(), PebbleError>;
+    async fn delete_draft(&self, draft_id: &str) -> Result<(), PebbleError>;
+}
+
+impl RemoteDraftOperations for ConnectedProvider {
+    async fn create_draft(&self, draft: &DraftMessage) -> Result<String, PebbleError> {
+        match self {
+            Self::Gmail(provider) => provider.save_draft(draft).await,
+            Self::Outlook(provider) => provider.save_draft(draft).await,
+            Self::Imap(_) => Err(PebbleError::UnsupportedProvider(
+                "IMAP remote drafts are not supported".to_string(),
+            )),
+        }
+    }
+
+    async fn update_draft(&self, draft_id: &str, draft: &DraftMessage) -> Result<(), PebbleError> {
+        match self {
+            Self::Gmail(provider) => provider.update_draft(draft_id, draft).await,
+            Self::Outlook(provider) => provider.update_draft(draft_id, draft).await,
+            Self::Imap(_) => Err(PebbleError::UnsupportedProvider(
+                "IMAP remote drafts are not supported".to_string(),
+            )),
+        }
+    }
+
+    async fn delete_draft(&self, draft_id: &str) -> Result<(), PebbleError> {
+        match self {
+            Self::Gmail(provider) => provider.delete_draft(draft_id).await,
+            Self::Outlook(provider) => provider.delete_draft(draft_id).await,
+            Self::Imap(_) => Ok(()),
+        }
+    }
+}
+
+fn requires_remote_draft_delete(provider_type: Option<ProviderType>) -> bool {
+    matches!(
+        provider_type,
+        Some(ProviderType::Gmail | ProviderType::Outlook)
+    )
 }
 
 fn resolve_draft_provenance(
     store: &pebble_store::Store,
     account_id: &str,
     existing_draft_id: Option<&str>,
-) -> Result<(Option<String>, Option<String>), PebbleError> {
+) -> std::result::Result<DraftProvenance, PebbleError> {
     let Some(draft_id) = existing_draft_id else {
-        return Ok((None, None));
+        return Ok(DraftProvenance {
+            local_id: None,
+            remote_id: None,
+        });
     };
+
     let Some(existing) = store.get_message(draft_id)? else {
-        return Ok((None, Some(draft_id.to_string())));
+        return Ok(DraftProvenance {
+            local_id: None,
+            remote_id: Some(draft_id.to_string()),
+        });
     };
+
     if existing.account_id != account_id || !existing.is_draft {
         return Err(PebbleError::Validation(
             "Existing draft does not belong to the selected account".to_string(),
         ));
     }
-    Ok((
-        Some(existing.id),
-        (!existing.remote_id.is_empty()).then_some(existing.remote_id),
-    ))
+
+    Ok(DraftProvenance {
+        local_id: Some(existing.id),
+        remote_id: (!existing.remote_id.is_empty()).then_some(existing.remote_id),
+    })
 }
 
-fn save_draft_locally(state: &AppStateRef, args: &SaveDraftArgs) -> Result<String, PebbleError> {
-    let account = state
-        .store
-        .get_account(&args.account_id)?
-        .ok_or_else(|| PebbleError::Internal(format!("Account not found: {}", args.account_id)))?;
-    let (local_id, remote_id) = resolve_draft_provenance(
-        &state.store,
-        &args.account_id,
-        args.existing_draft_id.as_deref(),
-    )?;
-    let id = local_id.clone().unwrap_or_else(new_id);
-    let previous_local_paths: Vec<String> = local_id
-        .as_deref()
-        .map(|draft_id| {
-            state
-                .store
-                .list_attachments_by_message(draft_id)
-                .map(|attachments| {
-                    attachments
-                        .into_iter()
-                        .filter_map(|a| a.local_path)
-                        .collect()
-                })
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    let raw_paths = args.attachment_paths.clone().unwrap_or_default();
-    let attachment_paths = validate_staged_attachment_paths(&state.attachments_dir, &raw_paths)?;
-    let attachment_records =
-        match stage_local_attachment_records(&state.attachments_dir, &id, &attachment_paths) {
-            Ok(records) => records,
-            Err(error) => return Err(error),
-        };
-    let now = now_timestamp();
-    let message = Message {
-        id: id.clone(),
-        account_id: account.id.clone(),
-        remote_id: remote_id.unwrap_or_default(),
-        message_id_header: None,
-        in_reply_to: args.in_reply_to.clone(),
-        references_header: None,
-        thread_id: None,
-        subject: args.subject.clone(),
-        snippet: args.body_text.chars().take(200).collect(),
-        from_address: account.email,
-        from_name: account.display_name,
-        to_list: parse_recipients(&args.to),
-        cc_list: parse_recipients(&args.cc),
-        bcc_list: parse_recipients(&args.bcc),
-        body_text: args.body_text.clone(),
-        body_html_raw: args.body_html.clone().unwrap_or_default(),
-        has_attachments: !attachment_records.is_empty(),
-        is_read: true,
-        is_starred: false,
-        is_draft: true,
-        date: now,
-        remote_version: None,
-        is_deleted: false,
-        deleted_at: None,
-        created_at: now,
-        updated_at: now,
-    };
-    let folder_ids = state
-        .store
-        .find_folder_by_role(&account.id, FolderRole::Drafts)?
-        .map(|folder| vec![folder.id])
-        .unwrap_or_default();
-    if let Err(error) =
-        state
-            .store
-            .replace_message_with_attachments(&message, &folder_ids, &attachment_records)
-    {
-        cleanup_local_attachment_records(&attachment_records);
-        return Err(error);
-    }
-    for path in previous_local_paths {
-        let _ = std::fs::remove_file(&path);
-        if let Some(parent) = std::path::Path::new(&path).parent() {
+fn cleanup_unreferenced_local_attachment_paths(state: &AppState, local_paths: &[String]) {
+    for path in local_paths {
+        match state.store.is_attachment_local_path_referenced(path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                warn!("Failed to check local attachment reference {path}: {error}");
+                continue;
+            }
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to delete local draft attachment {path}: {error}");
+            }
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
             let _ = std::fs::remove_dir(parent);
         }
     }
-    Ok(id)
 }
 
-fn delete_draft_locally(
-    state: &AppStateRef,
-    account_id: &str,
-    draft_id: &str,
-) -> Result<(), PebbleError> {
-    let Some(existing) = state.store.get_message(draft_id)? else {
-        return Ok(());
-    };
-    if existing.account_id != account_id || !existing.is_draft {
-        return Err(PebbleError::Validation(
-            "Draft does not belong to the selected account".to_string(),
-        ));
-    }
+fn delete_local_draft(state: &AppState, draft_id: &str) -> Result<(), PebbleError> {
     let local_paths: Vec<String> = state
         .store
         .list_attachments_by_message(draft_id)?
@@ -170,30 +116,302 @@ fn delete_draft_locally(
         .filter_map(|attachment| attachment.local_path)
         .collect();
     state.store.hard_delete_messages(&[draft_id.to_string()])?;
-    for path in local_paths {
-        let _ = std::fs::remove_file(&path);
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::remove_dir(parent);
+    cleanup_unreferenced_local_attachment_paths(state, &local_paths);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn save_draft(
+    state: AppStateRef,
+    account_id: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body_text: String,
+    body_html: Option<String>,
+    in_reply_to: Option<String>,
+    attachment_paths: Option<Vec<String>>,
+    existing_draft_id: Option<String>,
+) -> std::result::Result<String, PebbleError> {
+    let raw_attachment_paths = attachment_paths.unwrap_or_default();
+    let attachment_paths = if raw_attachment_paths.is_empty() {
+        raw_attachment_paths
+    } else {
+        validate_staged_attachment_paths(&state.attachments_dir, &raw_attachment_paths)?
+    };
+    let provenance = resolve_draft_provenance(
+        state.store.as_ref(),
+        &account_id,
+        existing_draft_id.as_deref(),
+    )?;
+    let draft = DraftMessage {
+        id: provenance.remote_id.clone(),
+        to: to
+            .into_iter()
+            .map(|a| EmailAddress {
+                name: None,
+                address: a,
+            })
+            .collect(),
+        cc: cc
+            .into_iter()
+            .map(|a| EmailAddress {
+                name: None,
+                address: a,
+            })
+            .collect(),
+        bcc: bcc
+            .into_iter()
+            .map(|a| EmailAddress {
+                name: None,
+                address: a,
+            })
+            .collect(),
+        subject,
+        body_text,
+        body_html,
+        in_reply_to,
+        attachment_paths,
+    };
+
+    let provider_type = state.store.get_account(&account_id)?.map(|a| a.provider);
+
+    match provider_type {
+        Some(pt) => {
+            if let Ok(conn) = ConnectedProvider::connect(&state, &account_id, &pt).await {
+                let result = if matches!(pt, ProviderType::Gmail | ProviderType::Outlook) {
+                    save_oauth_draft_with_fallback(&state, &account_id, &draft, &provenance, &conn)
+                        .await
+                } else {
+                    save_draft_locally(
+                        &state,
+                        &account_id,
+                        &draft,
+                        provenance.local_id.as_deref(),
+                        provenance.remote_id.as_deref(),
+                    )
+                };
+                conn.disconnect().await;
+                result
+            } else {
+                save_draft_locally(
+                    &state,
+                    &account_id,
+                    &draft,
+                    provenance.local_id.as_deref(),
+                    provenance.remote_id.as_deref(),
+                )
+            }
         }
+        None => save_draft_locally(
+            &state,
+            &account_id,
+            &draft,
+            provenance.local_id.as_deref(),
+            provenance.remote_id.as_deref(),
+        ),
+    }
+}
+
+async fn save_oauth_draft_with_fallback<R: RemoteDraftOperations>(
+    state: &AppState,
+    account_id: &str,
+    draft: &DraftMessage,
+    provenance: &DraftProvenance,
+    remote: &R,
+) -> Result<String, PebbleError> {
+    let remote_result = if let Some(remote_id) = provenance.remote_id.as_deref() {
+        remote
+            .update_draft(remote_id, draft)
+            .await
+            .map(|()| remote_id.to_string())
+    } else {
+        remote.create_draft(draft).await
+    };
+
+    match remote_result {
+        Ok(remote_id) => {
+            if let Some(local_id) = provenance.local_id.as_deref() {
+                if let Err(error) = delete_local_draft(state, local_id) {
+                    warn!(
+                        "Remote draft {remote_id} was saved, but local fallback {local_id} could not be deleted: {error}"
+                    );
+                }
+            }
+            Ok(remote_id)
+        }
+        Err(error) => {
+            warn!("Remote draft save failed; preserving encrypted local fallback: {error}");
+            save_draft_locally(
+                state,
+                account_id,
+                draft,
+                provenance.local_id.as_deref(),
+                provenance.remote_id.as_deref(),
+            )
+        }
+    }
+}
+
+fn save_draft_locally(
+    state: &AppState,
+    account_id: &str,
+    draft: &DraftMessage,
+    existing_local_id: Option<&str>,
+    remote_draft_id: Option<&str>,
+) -> std::result::Result<String, PebbleError> {
+    let id = existing_local_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(pebble_core::new_id);
+    let previous_local_paths: Vec<String> = state
+        .store
+        .list_attachments_by_message(&id)?
+        .into_iter()
+        .filter_map(|attachment| attachment.local_path)
+        .collect();
+    let attachment_records =
+        stage_local_attachment_records(&state.attachments_dir, &id, &draft.attachment_paths)?;
+
+    let msg = pebble_core::Message {
+        id: id.clone(),
+        account_id: account_id.to_string(),
+        remote_id: remote_draft_id.unwrap_or_default().to_string(),
+        message_id_header: None,
+        in_reply_to: draft.in_reply_to.clone(),
+        references_header: None,
+        thread_id: None,
+        subject: draft.subject.clone(),
+        snippet: draft.body_text.chars().take(200).collect(),
+        from_address: String::new(),
+        from_name: String::new(),
+        to_list: draft.to.clone(),
+        cc_list: draft.cc.clone(),
+        bcc_list: draft.bcc.clone(),
+        body_text: draft.body_text.clone(),
+        body_html_raw: draft.body_html.clone().unwrap_or_default(),
+        has_attachments: !attachment_records.is_empty(),
+        is_read: true,
+        is_starred: false,
+        is_draft: true,
+        date: pebble_core::now_timestamp(),
+        remote_version: None,
+        is_deleted: false,
+        deleted_at: None,
+        created_at: pebble_core::now_timestamp(),
+        updated_at: pebble_core::now_timestamp(),
+    };
+    // Attach the draft to the account's Drafts folder if one exists, so it
+    // shows up in the Drafts view. Falls back to no-folder for accounts
+    // without a Drafts folder (e.g. brand-new IMAP account that hasn't yet
+    // synced folder structure).
+    let folder_ids: Vec<String> = match state
+        .store
+        .find_folder_by_role(account_id, FolderRole::Drafts)
+    {
+        Ok(Some(f)) => vec![f.id],
+        _ => Vec::new(),
+    };
+    if let Err(error) =
+        state
+            .store
+            .replace_message_with_attachments(&msg, &folder_ids, &attachment_records)
+    {
+        cleanup_local_attachment_records(&attachment_records);
+        return Err(error);
+    }
+    cleanup_unreferenced_local_attachment_paths(state, &previous_local_paths);
+    Ok(id)
+}
+
+pub async fn delete_draft(
+    state: AppStateRef,
+    account_id: String,
+    draft_id: String,
+) -> std::result::Result<(), PebbleError> {
+    let provenance = resolve_draft_provenance(state.store.as_ref(), &account_id, Some(&draft_id))?;
+    let provider_type = state.store.get_account(&account_id)?.map(|a| a.provider);
+
+    if requires_remote_draft_delete(provider_type.clone()) {
+        if let Some(remote_id) = provenance.remote_id.as_deref() {
+            let provider = provider_type.as_ref().ok_or_else(|| {
+                PebbleError::Internal(
+                    "OAuth draft deletion requires a persisted account provider".to_string(),
+                )
+            })?;
+            let conn = ConnectedProvider::connect(&state, &account_id, provider)
+                .await
+                .map_err(|error| {
+                    PebbleError::Network(format!(
+                        "Could not connect to delete remote draft; local fallback was retained: {error}"
+                    ))
+                })?;
+            let delete_result = conn.delete_draft(remote_id).await;
+            conn.disconnect().await;
+            delete_result?;
+        }
+    }
+
+    if let Some(local_id) = provenance.local_id.as_deref() {
+        delete_local_draft(&state, local_id)?;
     }
     Ok(())
 }
 
-pub async fn save_draft(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let args: SaveDraftArgs = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid save_draft args: {e}")))?;
-    let id = run_blocking(move || save_draft_locally(&state, &args)).await?;
-    Ok(Value::String(id))
-}
 
-pub async fn delete_draft(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    #[derive(Deserialize)]
-    struct Args {
-        account_id: String,
-        draft_id: String,
+
+pub async fn dispatch_command(
+    state: AppStateRef,
+    command: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, crate::error::ApiError> {
+    use crate::error::ApiError;
+    match command {
+        "save_draft" => {
+            #[derive(serde::Deserialize)]
+            struct Args {
+                account_id: String,
+                to: Vec<String>,
+                cc: Vec<String>,
+                bcc: Vec<String>,
+                subject: String,
+                body_text: String,
+                #[serde(default)] body_html: Option<String>,
+                #[serde(default)] in_reply_to: Option<String>,
+                #[serde(default)] attachment_paths: Option<Vec<String>>,
+                #[serde(default)] existing_draft_id: Option<String>,
+            }
+            let args: Args = serde_json::from_value(args).map_err(|error| {
+                ApiError::BadRequest(format!("invalid save_draft args: {error}"))
+            })?;
+            let id = save_draft(
+                state,
+                args.account_id,
+                args.to,
+                args.cc,
+                args.bcc,
+                args.subject,
+                args.body_text,
+                args.body_html,
+                args.in_reply_to,
+                args.attachment_paths,
+                args.existing_draft_id,
+            )
+            .await
+            .map_err(ApiError::from_pebble)?;
+            Ok(serde_json::json!(id))
+        }
+        "delete_draft" => {
+            #[derive(serde::Deserialize)]
+            struct Args { account_id: String, draft_id: String }
+            let args: Args = serde_json::from_value(args).map_err(|error| {
+                ApiError::BadRequest(format!("invalid delete_draft args: {error}"))
+            })?;
+            delete_draft(state, args.account_id, args.draft_id)
+                .await
+                .map_err(ApiError::from_pebble)?;
+            Ok(serde_json::Value::Null)
+        }
+        _ => Err(ApiError::NotFound(format!("unknown command: {command}"))),
     }
-    let args: Args = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid delete_draft args: {e}")))?;
-    run_blocking(move || delete_draft_locally(&state, &args.account_id, &args.draft_id)).await?;
-    Ok(Value::Null)
 }

@@ -1,8 +1,9 @@
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
-    http::header,
+    extract::{Multipart, Path as AxumPath, State},
+    http::{header, HeaderMap},
     response::Response,
+    Json,
 };
 use pebble_core::{new_id, PebbleError};
 use serde::Serialize;
@@ -11,11 +12,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio_util::io::ReaderStream;
 
+use crate::auth;
 use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-const MAX_BACKGROUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_BACKGROUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_BACKGROUND_MULTIPART_BODY_BYTES: usize = MAX_BACKGROUND_IMAGE_BYTES + 1024 * 1024;
 const BACKGROUND_IMAGE_URL_PREFIX: &str = "/api/v1/background-images/";
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,18 +108,30 @@ fn write_background_image(
         .create_new(true)
         .open(&path)
         .map_err(|e| PebbleError::Internal(format!("Failed to create background image: {e}")))?;
-    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-        let _ = std::fs::remove_file(&path);
-        return Err(PebbleError::Internal(format!(
-            "Failed to write background image: {error}"
-        )));
-    }
+    file.write_all(bytes)
+        .map_err(|e| PebbleError::Internal(format!("Failed to write background image: {e}")))?;
+    file.sync_all()
+        .map_err(|e| PebbleError::Internal(format!("Failed to flush background image: {e}")))?;
 
     Ok(ImportedBackgroundImage {
         path: format!("{BACKGROUND_IMAGE_URL_PREFIX}{filename}"),
         filename,
         size: bytes.len() as u64,
     })
+}
+
+async fn write_background_image_task(
+    backgrounds_dir: PathBuf,
+    bytes: Vec<u8>,
+) -> Result<ImportedBackgroundImage, ApiError> {
+    tokio::task::spawn_blocking(move || write_background_image(&backgrounds_dir, &bytes))
+        .await
+        .map_err(|e| {
+            ApiError::from_pebble(PebbleError::Internal(format!(
+                "Background image write task failed: {e}"
+            )))
+        })?
+        .map_err(ApiError::from_pebble)
 }
 
 fn delete_background_image_file(backgrounds_dir: &Path, filename: &str) -> Result<(), PebbleError> {
@@ -166,8 +181,52 @@ pub async fn import_background_image(state: AppStateRef, args: Value) -> Result<
     let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid import_background_image args: {e}")))?;
     let dir = backgrounds_dir(&state);
-    let imported = run_blocking(move || write_background_image(&dir, &args.bytes)).await?;
+    let imported = write_background_image_task(dir, args.bytes).await?;
     serde_json::to_value(imported).map_err(ApiError::from_serialize)
+}
+
+/// Browser upload endpoint for background images.
+///
+/// The shared frontend still calls the Tauri-shaped command with `bytes`, but
+/// the Web invoke shim sends those bytes as multipart data so a valid 10 MiB
+/// image is not expanded into a much larger JSON number array on the wire.
+pub async fn import_background_image_multipart(
+    State(state): State<AppStateRef>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, ApiError> {
+    auth::require_auth(&state, &headers)?;
+
+    let mut file_bytes = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("invalid background upload: {error}")))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let bytes = field.bytes().await.map_err(|error| {
+            ApiError::BadRequest(format!("invalid background image bytes: {error}"))
+        })?;
+        if bytes.len() > MAX_BACKGROUND_IMAGE_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "Background image is too large (max {} MB)",
+                MAX_BACKGROUND_IMAGE_BYTES / 1024 / 1024
+            )));
+        }
+        file_bytes = Some(bytes);
+        break;
+    }
+
+    let bytes = file_bytes.ok_or_else(|| {
+        ApiError::BadRequest("multipart upload is missing the file field".to_string())
+    })?;
+    let dir = backgrounds_dir(&state);
+    let imported = write_background_image_task(dir, bytes.to_vec()).await?;
+    Ok(Json(
+        serde_json::to_value(imported).map_err(ApiError::from_serialize)?,
+    ))
 }
 
 pub async fn delete_background_image(state: AppStateRef, args: Value) -> Result<Value, ApiError> {

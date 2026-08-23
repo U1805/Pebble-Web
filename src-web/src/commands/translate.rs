@@ -10,7 +10,35 @@ use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-fn decrypt_config(
+fn hex_decode(s: &str) -> Result<Vec<u8>, PebbleError> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(PebbleError::Internal(
+            "Invalid hex string length".to_string(),
+        ));
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])
+                .ok_or_else(|| PebbleError::Internal("Invalid hex digit".to_string()))?;
+            let low = hex_nibble(pair[1])
+                .ok_or_else(|| PebbleError::Internal("Invalid hex digit".to_string()))?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+pub(crate) fn decrypt_config(
     crypto: &pebble_crypto::CryptoService,
     store: &pebble_store::Store,
     stored: &str,
@@ -21,8 +49,7 @@ fn decrypt_config(
         return Ok(stored.to_string());
     }
 
-    let encrypted = hex::decode(stored)
-        .map_err(|e| PebbleError::Internal(format!("Invalid translate config encoding: {e}")))?;
+    let encrypted = hex_decode(stored)?;
     let needs_migration = pebble_crypto::CryptoService::ciphertext_needs_migration(&encrypted);
     let plaintext = crypto.decrypt_for(
         TRANSLATE_CONFIG_PURPOSE,
@@ -30,7 +57,7 @@ fn decrypt_config(
         &encrypted,
     )?;
     let plaintext = String::from_utf8(plaintext)
-        .map_err(|e| PebbleError::Internal(format!("Invalid UTF-8 in translate config: {e}")))?;
+        .map_err(|e| PebbleError::Internal(format!("Invalid UTF-8 in decrypted config: {e}")))?;
     if needs_migration {
         let replacement = encrypt_config(crypto, &plaintext)?;
         store.compare_exchange_translate_config_blob(stored, &replacement)?;
@@ -38,7 +65,7 @@ fn decrypt_config(
     Ok(plaintext)
 }
 
-fn encrypt_config(
+pub(crate) fn encrypt_config(
     crypto: &pebble_crypto::CryptoService,
     plaintext: &str,
 ) -> Result<String, PebbleError> {
@@ -64,14 +91,13 @@ fn validate_translate_url(url: &str) -> Result<(), PebbleError> {
         return Ok(());
     }
     if let Some(after_scheme) = url.strip_prefix("http://") {
-        let authority = after_scheme.split('/').next().unwrap_or("");
-        // IPv6 literals contain colons, so preserve a bracketed host before
-        // stripping an optional port from ordinary hostnames.
-        let host = if let Some(end) = authority.find(']') {
-            &authority[..=end]
-        } else {
-            authority.split(':').next().unwrap_or("")
-        };
+        let host = after_scheme
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
         if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
             return Ok(());
         }

@@ -31,6 +31,10 @@ pub struct AppState {
     /// Server-side OAuth transactions. The PKCE verifier and form data never
     /// leave the service or live in browser-controlled storage.
     pub(crate) oauth_pending: Arc<Mutex<HashMap<String, crate::oauth::PendingOAuth>>>,
+    /// Browser OAuth flow state after the redirect callback arrives. This lets
+    /// the opener recover the command result even when the popup closes while
+    /// token exchange or account persistence is still running.
+    pub(crate) oauth_flow_status: Arc<Mutex<HashMap<String, crate::oauth::OAuthFlowStatus>>>,
 }
 
 pub type AppStateRef = Arc<AppState>;
@@ -59,6 +63,7 @@ impl AppState {
 
         let (ws_broadcast, _) = broadcast::channel(100);
         let oauth_pending = Arc::new(Mutex::new(HashMap::new()));
+        let oauth_flow_status = Arc::new(Mutex::new(HashMap::new()));
         let oauth_account_locks = Arc::new(Mutex::new(HashMap::new()));
         let secure_user_data_locks = Arc::new(Mutex::new(HashMap::new()));
         let sync_manager = Arc::new(SyncManager::new(
@@ -82,6 +87,7 @@ impl AppState {
             sync_manager,
             ws_broadcast,
             oauth_pending,
+            oauth_flow_status,
         }))
     }
 }

@@ -38,3 +38,6 @@ url = "2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 uuid = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }

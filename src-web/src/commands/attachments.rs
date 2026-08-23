@@ -16,9 +16,6 @@ use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-const MAX_STAGED_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
-const MAX_STAGED_ATTACHMENT_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
-pub(crate) const MAX_MULTIPART_BODY_BYTES: usize = 100 * 1024 * 1024;
 static COMPOSE_STAGING_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// 列出邮件的附件。
@@ -69,8 +66,16 @@ fn is_windows_reserved_name(name: &str) -> bool {
 /// the server-owned compose_staging directory.
 fn sanitize_staged_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let mut cleaned = base.replace("..", ".");
-    cleaned = cleaned
+    if base == "." || base == ".." {
+        return "attachment".to_string();
+    }
+
+    let mut cleaned = base.to_string();
+    while cleaned.contains("..") {
+        cleaned = cleaned.replace("..", ".");
+    }
+
+    let sanitized: String = cleaned
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
@@ -78,10 +83,13 @@ fn sanitize_staged_filename(name: &str) -> String {
         })
         .filter(|c| !c.is_control())
         .collect();
-    let trimmed = cleaned.trim().trim_matches(|c: char| c == '.' || c == ' ');
+    let trimmed = sanitized
+        .trim()
+        .trim_matches(|c: char| c == '.' || c == ' ');
     if trimmed.is_empty() {
         return "attachment".to_string();
     }
+
     let stem = Path::new(trimmed)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -89,44 +97,91 @@ fn sanitize_staged_filename(name: &str) -> String {
     if is_windows_reserved_name(stem) {
         return "attachment".to_string();
     }
+
     trimmed.to_string()
 }
 
-fn staged_total_bytes(staging_dir: &Path) -> Result<u64, PebbleError> {
-    let mut total = 0_u64;
-    let entries = match std::fs::read_dir(staging_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => {
-            return Err(PebbleError::Internal(format!(
-                "Failed to inspect compose staging directory: {error}"
-            )))
+fn copy_attachment_file_safely(source: &Path, save_path: &Path) -> Result<PathBuf, PebbleError> {
+    use std::io::{Read, Write};
+
+    let mut src_file = std::fs::File::open(source)
+        .map_err(|e| PebbleError::Internal(format!("Failed to open source: {e}")))?;
+    let _total_bytes = src_file
+        .metadata()
+        .map_err(|e| PebbleError::Internal(format!("Failed to read file metadata: {e}")))?
+        .len();
+
+    let (actual_save_path, mut dst_file) = create_unique_target(save_path)?;
+    let mut buf = [0u8; 8192];
+
+    let copy_result: Result<(), PebbleError> = (|| {
+        loop {
+            let n = src_file
+                .read(&mut buf)
+                .map_err(|e| PebbleError::Internal(format!("Read error: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            dst_file
+                .write_all(&buf[..n])
+                .map_err(|e| PebbleError::Internal(format!("Write error: {e}")))?;
         }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            PebbleError::Internal(format!("Failed to inspect staged attachment: {e}"))
-        })?;
-        let metadata = entry.metadata().map_err(|e| {
-            PebbleError::Internal(format!("Failed to inspect staged attachment: {e}"))
-        })?;
-        if metadata.is_dir() {
-            for child in std::fs::read_dir(entry.path()).map_err(|e| {
-                PebbleError::Internal(format!("Failed to inspect staged attachment: {e}"))
-            })? {
-                let child = child.map_err(|e| {
-                    PebbleError::Internal(format!("Failed to inspect staged attachment: {e}"))
-                })?;
-                let child_metadata = child.metadata().map_err(|e| {
-                    PebbleError::Internal(format!("Failed to inspect staged attachment: {e}"))
-                })?;
-                if child_metadata.is_file() {
-                    total = total.saturating_add(child_metadata.len());
-                }
+        dst_file
+            .sync_all()
+            .map_err(|e| PebbleError::Internal(format!("Failed to flush file: {e}")))?;
+        Ok(())
+    })();
+
+    if let Err(error) = copy_result {
+        drop(dst_file);
+        let _ = std::fs::remove_file(&actual_save_path);
+        return Err(error);
+    }
+
+    Ok(actual_save_path)
+}
+
+fn create_unique_target(save_path: &Path) -> Result<(PathBuf, std::fs::File), PebbleError> {
+    const MAX_UNIQUE_ATTEMPTS: u32 = 1000;
+
+    for attempt in 0..MAX_UNIQUE_ATTEMPTS {
+        let candidate = unique_save_path(save_path, attempt);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PebbleError::Internal(format!(
+                    "Failed to create target file: {error}"
+                )))
             }
         }
     }
-    Ok(total)
+
+    Err(PebbleError::Validation(
+        "Could not choose an unused filename for attachment download".to_string(),
+    ))
+}
+
+fn unique_save_path(save_path: &Path, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        return save_path.to_path_buf();
+    }
+
+    let parent = save_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = save_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let extension = save_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    parent.join(format!("{stem} ({attempt}){extension}"))
 }
 
 pub(crate) fn stage_compose_attachment_bytes(
@@ -134,37 +189,34 @@ pub(crate) fn stage_compose_attachment_bytes(
     filename: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, PebbleError> {
-    if bytes.len() > MAX_STAGED_ATTACHMENT_BYTES {
-        return Err(PebbleError::Validation(format!(
-            "Attachment exceeds the {} MiB per-file limit",
-            MAX_STAGED_ATTACHMENT_BYTES / (1024 * 1024)
-        )));
-    }
     let staging_dir = attachments_dir.join("compose_staging");
     std::fs::create_dir_all(&staging_dir).map_err(|e| {
-        PebbleError::Internal(format!("Failed to create compose staging directory: {e}"))
+        PebbleError::Internal(format!(
+            "Failed to create compose attachment staging directory {}: {e}",
+            staging_dir.display()
+        ))
     })?;
-    let staging_dir = staging_dir.canonicalize().map_err(|e| {
-        PebbleError::Internal(format!("Failed to resolve compose staging directory: {e}"))
+    let canonical_staging_dir = staging_dir.canonicalize().map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to resolve compose attachment staging directory {}: {e}",
+            staging_dir.display()
+        ))
     })?;
-    let total = staged_total_bytes(&staging_dir)?;
-    if total.saturating_add(bytes.len() as u64) > MAX_STAGED_ATTACHMENT_TOTAL_BYTES {
-        return Err(PebbleError::Validation(format!(
-            "Compose staging exceeds the {} MiB total limit",
-            MAX_STAGED_ATTACHMENT_TOTAL_BYTES / (1024 * 1024)
-        )));
-    }
-    let staged_dir = staging_dir.join(pebble_core::new_id());
+    let safe_filename = sanitize_staged_filename(filename);
+    let staged_dir = canonical_staging_dir.join(pebble_core::new_id());
     std::fs::create_dir_all(&staged_dir).map_err(|e| {
-        PebbleError::Internal(format!("Failed to create staged attachment directory: {e}"))
+        PebbleError::Internal(format!(
+            "Failed to create compose attachment staging directory {}: {e}",
+            staged_dir.display()
+        ))
     })?;
-    let staged_path = staged_dir.join(sanitize_staged_filename(filename));
-    if let Err(error) = std::fs::write(&staged_path, bytes) {
-        let _ = std::fs::remove_dir_all(&staged_dir);
-        return Err(PebbleError::Internal(format!(
-            "Failed to stage compose attachment: {error}"
-        )));
-    }
+    let staged_path = staged_dir.join(safe_filename);
+    std::fs::write(&staged_path, bytes).map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to stage compose attachment {}: {e}",
+            staged_path.display()
+        ))
+    })?;
     Ok(staged_path)
 }
 
@@ -174,25 +226,46 @@ pub(crate) fn cleanup_staged_compose_attachment_path(
 ) -> Result<(), PebbleError> {
     let staging_dir = attachments_dir.join("compose_staging");
     let canonical_staging_dir = staging_dir.canonicalize().map_err(|e| {
-        PebbleError::Internal(format!("Failed to resolve compose staging directory: {e}"))
+        PebbleError::Internal(format!(
+            "Failed to resolve compose attachment staging directory {}: {e}",
+            staging_dir.display()
+        ))
     })?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|e| PebbleError::Internal(format!("Failed to resolve staged attachment: {e}")))?;
+    let canonical_path = path.canonicalize().map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to resolve staged compose attachment {}: {e}",
+            path.display()
+        ))
+    })?;
     let parent = canonical_path.parent().ok_or_else(|| {
-        PebbleError::Validation("Staged attachment has no parent directory".to_string())
+        PebbleError::Validation("Staged compose attachment has no parent directory".to_string())
     })?;
     if !canonical_path.starts_with(&canonical_staging_dir)
         || parent.parent() != Some(canonical_staging_dir.as_path())
         || !canonical_path.is_file()
     {
-        return Err(PebbleError::Validation(
-            "Path is not a staged compose attachment".to_string(),
-        ));
+        return Err(PebbleError::Validation(format!(
+            "Path is not a staged compose attachment: {}",
+            canonical_path.display()
+        )));
     }
-    std::fs::remove_file(&canonical_path)
-        .map_err(|e| PebbleError::Internal(format!("Failed to remove staged attachment: {e}")))?;
-    let _ = std::fs::remove_dir(parent);
+
+    std::fs::remove_file(&canonical_path).map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to remove staged compose attachment {}: {e}",
+            canonical_path.display()
+        ))
+    })?;
+    if let Err(error) = std::fs::remove_dir(parent) {
+        if error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(PebbleError::Internal(format!(
+                "Failed to remove staged compose attachment directory {}: {error}",
+                parent.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -238,20 +311,25 @@ pub(crate) fn stage_local_attachment_records(
     }
     let message_dir = attachments_root.join(message_id);
     std::fs::create_dir_all(&message_dir).map_err(|e| {
-        PebbleError::Internal(format!("Failed to create local attachment directory: {e}"))
+        PebbleError::Internal(format!(
+            "Failed to create local attachment directory {}: {e}",
+            message_dir.display()
+        ))
     })?;
     let mut records = Vec::with_capacity(source_paths.len());
     for source in source_paths {
         let source_path = Path::new(source);
         let metadata = source_path.metadata().map_err(|e| {
             cleanup_local_attachment_records(&records);
-            PebbleError::Internal(format!("Attachment source not available: {source} ({e})"))
+            PebbleError::Internal(format!(
+                "Attachment source file not available: {source} ({e})"
+            ))
         })?;
         if !metadata.is_file() {
             cleanup_local_attachment_records(&records);
-            return Err(PebbleError::Validation(
-                "Attachment source is not a file".to_string(),
-            ));
+            return Err(PebbleError::Validation(format!(
+                "Attachment source is not a file: {source}"
+            )));
         }
         let filename = sanitize_staged_filename(
             source_path
@@ -263,24 +341,29 @@ pub(crate) fn stage_local_attachment_records(
         if let Err(error) = std::fs::create_dir_all(&attachment_dir) {
             cleanup_local_attachment_records(&records);
             return Err(PebbleError::Internal(format!(
-                "Failed to create local attachment directory: {error}"
+                "Failed to create local attachment directory {}: {error}",
+                attachment_dir.display()
             )));
         }
         let target = attachment_dir.join(&filename);
-        if let Err(error) = std::fs::copy(source_path, &target) {
-            let _ = std::fs::remove_dir_all(&attachment_dir);
-            cleanup_local_attachment_records(&records);
-            return Err(PebbleError::Internal(format!(
-                "Failed to copy attachment: {error}"
-            )));
-        }
+        let staged_path = match copy_attachment_file_safely(source_path, &target) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&attachment_dir);
+                cleanup_local_attachment_records(&records);
+                return Err(error);
+            }
+        };
+        let size = std::fs::metadata(&staged_path)
+            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+            .unwrap_or(0);
         records.push(Attachment {
             id: pebble_core::new_id(),
             message_id: message_id.to_string(),
             filename,
             mime_type: "application/octet-stream".to_string(),
-            size: metadata.len().min(i64::MAX as u64) as i64,
-            local_path: Some(target.to_string_lossy().into_owned()),
+            size,
+            local_path: Some(staged_path.to_string_lossy().into_owned()),
             content_id: None,
             is_inline: false,
         });
@@ -290,11 +373,18 @@ pub(crate) fn stage_local_attachment_records(
 
 pub(crate) fn cleanup_local_attachment_records(records: &[Attachment]) {
     for record in records {
-        let Some(path) = record.local_path.as_deref() else {
+        let Some(path) = record.local_path.as_deref().map(Path::new) else {
             continue;
         };
-        let _ = std::fs::remove_file(path);
-        if let Some(parent) = Path::new(path).parent() {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Failed to remove staged attachment: {error}"
+                );
+            }
+        }
+        if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir(parent);
         }
     }
@@ -425,34 +515,30 @@ pub async fn download_attachment(
         .store
         .get_attachment(&attachment_id)
         .map_err(ApiError::from_store)?
-        .ok_or_else(|| ApiError::NotFound("attachment not found".to_string()))?;
+        .ok_or_else(|| PebbleError::Internal("Attachment not found".to_string()))
+        .map_err(ApiError::from_pebble)?;
 
     let attachments_dir = state.attachments_dir.clone();
-    let file_path = match &attachment.local_path {
-        Some(path) if std::path::Path::new(path).is_absolute() => std::path::PathBuf::from(path),
-        // 相对路径（历史数据或测试数据）按附件根目录解析
-        Some(path) => attachments_dir.join(path),
-        None => {
-            // 无 local_path（如未落盘）时按约定路径推导：attachments/{message_id}/{filename}
-            let safe_filename = std::path::Path::new(&attachment.filename)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("attachment")
-                .to_string();
-            attachments_dir
-                .join(&attachment.message_id)
-                .join(safe_filename)
-        }
+    let stored_path = attachment
+        .local_path
+        .as_deref()
+        .ok_or_else(|| PebbleError::Internal("Attachment file not available".to_string()))
+        .map_err(ApiError::from_pebble)?;
+    let file_path = if Path::new(stored_path).is_absolute() {
+        PathBuf::from(stored_path)
+    } else {
+        // Web 服务只允许从自己的附件根目录读取文件。
+        attachments_dir.join(stored_path)
     };
 
-    // 防路径穿越：解析后必须位于附件根目录内
+    // Web HTTP 端点的额外安全边界：源文件必须位于 Pebble 附件目录。
     let allowed_dir = attachments_dir
         .canonicalize()
         .unwrap_or_else(|_| attachments_dir.clone());
     tracing::debug!(%attachment_id, file_path = %file_path.display(), allowed = %allowed_dir.display(), "download attachment resolve");
-    let canonical_path = file_path
-        .canonicalize()
-        .map_err(|_| ApiError::NotFound("attachment file not found".to_string()))?;
+    let canonical_path = file_path.canonicalize().map_err(|e| {
+        ApiError::from_pebble(PebbleError::Internal(format!("Failed to open source: {e}")))
+    })?;
     if !canonical_path.starts_with(&allowed_dir) {
         return Err(ApiError::BadRequest(
             "attachment path outside allowed directory".to_string(),
@@ -461,12 +547,23 @@ pub async fn download_attachment(
 
     let file = tokio::fs::File::open(&canonical_path)
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to open file: {e}")))?;
+        .map_err(|e| {
+            ApiError::from_pebble(PebbleError::Internal(format!("Failed to open source: {e}")))
+        })?;
+    let actual_size = file
+        .metadata()
+        .await
+        .map_err(|e| {
+            ApiError::from_pebble(PebbleError::Internal(format!(
+                "Failed to read file metadata: {e}"
+            )))
+        })?
+        .len();
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
     let mime = attachment.mime_type.clone();
-    let filename = sanitize_filename_header(&attachment.filename);
+    let disposition = content_disposition_attachment(&attachment.filename);
 
     Ok(Response::builder()
         .header(
@@ -477,16 +574,33 @@ pub async fn download_attachment(
                 &mime
             },
         )
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .header(header::CONTENT_LENGTH, attachment.size.to_string())
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, actual_size.to_string())
         .body(body)
         .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))?)
 }
 
-/// Content-Disposition 文件名清洗：去掉引号与 CR/LF，防 header 注入。
-fn sanitize_filename_header(name: &str) -> String {
-    name.replace(['"', '\r', '\n'], "_")
+fn content_disposition_attachment(name: &str) -> String {
+    let safe_name = name.replace(['"', '\r', '\n'], "_");
+    let ascii_fallback = safe_name
+        .chars()
+        .map(|ch| if ch.is_ascii() && !ch.is_ascii_control() { ch } else { '_' })
+        .collect::<String>();
+    let encoded = percent_encode_header_value(safe_name.as_bytes());
+    format!(
+        "attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+    )
+}
+
+fn percent_encode_header_value(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }

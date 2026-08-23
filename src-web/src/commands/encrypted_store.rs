@@ -66,10 +66,6 @@ pub(crate) fn store_account_auth_data(
     store.set_auth_data(account_id, &encrypted)
 }
 
-pub(crate) fn clear_account_auth_data(store: &Store, account_id: &str) -> Result<()> {
-    store.clear_auth_data(account_id)
-}
-
 pub(crate) fn encrypt_secure_user_data(
     crypto: &CryptoService,
     key: &str,

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::backup::{build_backup_data, restore_backup_data};
+use crate::commands::encrypted_store;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
@@ -82,13 +83,20 @@ pub async fn restore_from_webdav(state: AppStateRef, args: Value) -> Result<Valu
 
 // ─── 自动备份配置（secure_user_data，与桌面端同 key） ───────────────
 
-fn validate_interval(interval_minutes: u64) -> Result<(), PebbleError> {
+fn auto_backup_interval_duration(interval_minutes: u64) -> Result<std::time::Duration, PebbleError> {
     if !SUPPORTED_INTERVALS_MINUTES.contains(&interval_minutes) {
-        return Err(PebbleError::Validation(format!(
+        return Err(PebbleError::Internal(format!(
             "Unsupported auto-backup interval: {interval_minutes} minutes"
         )));
     }
-    Ok(())
+    let seconds = interval_minutes
+        .checked_mul(60)
+        .ok_or_else(|| PebbleError::Internal("Auto-backup interval is too large".to_string()))?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn validate_interval(interval_minutes: u64) -> Result<(), PebbleError> {
+    auto_backup_interval_duration(interval_minutes).map(|_| ())
 }
 
 pub fn save_auto_backup_config(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
@@ -99,26 +107,25 @@ pub fn save_auto_backup_config(state: AppStateRef, args: Value) -> Result<Value,
     validate_interval(config.interval_minutes)?;
     let json = serde_json::to_vec(&config)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize config: {e}")))?;
-    let encrypted =
-        state
-            .crypto
-            .encrypt_for("secure_user_data.value", AUTO_BACKUP_CONFIG_KEY, &json)?;
-    state
-        .store
-        .set_secure_user_data(AUTO_BACKUP_CONFIG_KEY, &encrypted)?;
+    encrypted_store::store_secure_user_data(
+        &state.crypto,
+        &state.store,
+        AUTO_BACKUP_CONFIG_KEY,
+        &json,
+    )?;
     Ok(Value::Null)
 }
 
 fn load_config(state: &AppStateRef) -> Result<Option<AutoBackupConfig>, PebbleError> {
-    let Some(encrypted) = state.store.get_secure_user_data(AUTO_BACKUP_CONFIG_KEY)? else {
+    let Some(plaintext) = encrypted_store::load_secure_user_data(
+        &state.crypto,
+        &state.store,
+        AUTO_BACKUP_CONFIG_KEY,
+    )? else {
         return Ok(None);
     };
-    let plaintext =
-        state
-            .crypto
-            .decrypt_for("secure_user_data.value", AUTO_BACKUP_CONFIG_KEY, &encrypted)?;
     let config: AutoBackupConfig = serde_json::from_slice(&plaintext).map_err(|e| {
-        PebbleError::Internal(format!("Failed to deserialize auto-backup config: {e}"))
+        PebbleError::Internal(format!("Failed to deserialize config: {e}"))
     })?;
     validate_interval(config.interval_minutes)?;
     Ok(Some(config))
@@ -136,22 +143,51 @@ pub fn delete_auto_backup_config(state: AppStateRef, _args: Value) -> Result<Val
     Ok(Value::Null)
 }
 
-/// 自动备份循环：每 60s 检查一次已启用且到期的配置，执行一次 WebDAV 上传。
-/// 与桌面端 run_auto_backup_worker 语义对齐（Web 端为 tokio 后台任务）。
+/// Auto-backup worker. The 60-second timer only checks whether the configured
+/// interval has elapsed; it does not perform a backup on every check.
 pub async fn run_auto_backup_worker(state: AppStateRef) {
-    let check_interval = std::time::Duration::from_secs(60);
+    const AUTO_BACKUP_CHECK_INTERVAL_SECS: u64 = 60;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        AUTO_BACKUP_CHECK_INTERVAL_SECS,
+    ));
+    let mut last_backup_at: Option<std::time::Instant> = None;
+
     loop {
-        tokio::time::sleep(check_interval).await;
-        let Ok(Some(config)) = load_config(&state) else {
-            continue;
+        interval.tick().await;
+
+        let config = match load_config(&state) {
+            Ok(Some(config)) if config.enabled => config,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!("[auto-backup] invalid stored config; backup disabled: {error}");
+                continue;
+            }
         };
-        if !config.enabled {
+        let backup_interval = match auto_backup_interval_duration(config.interval_minutes) {
+            Ok(interval) => interval,
+            Err(error) => {
+                tracing::warn!("[auto-backup] invalid interval; backup disabled: {error}");
+                continue;
+            }
+        };
+        if last_backup_at.is_some_and(|last| last.elapsed() < backup_interval) {
             continue;
         }
-        tracing::info!("auto backup worker checking webdav backup");
+
+        tracing::info!("[auto-backup] starting scheduled WebDAV backup");
         match run_backup_once(&state, &config).await {
-            Ok(_) => tracing::info!("auto backup completed"),
-            Err(e) => tracing::warn!("auto backup failed: {e}"),
+            Ok(()) => {
+                last_backup_at = Some(std::time::Instant::now());
+                tracing::info!("[auto-backup] backup completed successfully");
+                let _ = state.ws_broadcast.send(
+                    serde_json::json!({
+                        "type": "cloud-sync:auto-backup-complete",
+                        "payload": serde_json::Value::Null,
+                    })
+                    .to_string(),
+                );
+            }
+            Err(error) => tracing::warn!("[auto-backup] backup failed: {error}"),
         }
     }
 }

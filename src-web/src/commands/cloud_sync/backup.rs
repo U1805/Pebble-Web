@@ -1,24 +1,18 @@
-use std::collections::HashMap;
-
 use pebble_core::PebbleError;
-use pebble_crypto::{
-    passphrase::{decrypt_with_passphrase, encrypt_with_passphrase, PassphraseEncryptedBlob},
-    CryptoService,
+use pebble_crypto::passphrase::{
+    decrypt_with_passphrase, encrypt_with_passphrase, PassphraseEncryptedBlob,
 };
 use pebble_store::cloud_sync::{
     preview_backup, serialize_backup, BackupPreview, BackupSecretSummary, RestoredAuthData,
     RestoredPrivateData, RestoredSecureUserData, SettingsBackup,
 };
-use pebble_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::commands::encrypted_store;
-use crate::commands::encrypted_store::{ACTIVE_TRANSLATE_CONFIG_ID, TRANSLATE_CONFIG_PURPOSE};
+use crate::commands::{encrypted_store, kanban, translate};
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-const KANBAN_CONTEXT_NOTES_KEY: &str = "kanban_context_notes";
 
 /// 备份文件导出参数（后端 snake_case 契约，调用层已由前端转换）。
 #[derive(Deserialize)]
@@ -71,51 +65,11 @@ fn secret_summary(secrets: &BackupSecrets) -> BackupSecretSummary {
     }
 }
 
-// ─── secure user data / translate 加解密（供备份打包与恢复） ───────────
-
-fn encrypt_secure_user_data(
-    crypto: &CryptoService,
-    key: &str,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, PebbleError> {
-    crypto.encrypt_for(encrypted_store::SECURE_USER_DATA_PURPOSE, key, plaintext)
-}
-
-fn decrypt_translate_config_ext(
-    crypto: &CryptoService,
-    stored: &str,
-) -> Result<String, PebbleError> {
-    // 与桌面端 decrypt_config 语义一致：legacy plaintext JSON 直接当原文，
-    // 否则 hex 解码后按目的用途解密（此处不做 in-place 迁移，备份场景无需）。
-    if serde_json::from_str::<Value>(stored).is_ok() {
-        return Ok(stored.to_string());
-    }
-    let bytes = hex::decode(stored)
-        .map_err(|e| PebbleError::Internal(format!("Invalid translate config hex: {e}")))?;
-    let decrypted =
-        crypto.decrypt_for(TRANSLATE_CONFIG_PURPOSE, ACTIVE_TRANSLATE_CONFIG_ID, &bytes)?;
-    String::from_utf8(decrypted)
-        .map_err(|e| PebbleError::Internal(format!("Invalid UTF-8 in translate config: {e}")))
-}
-
-fn encrypt_translate_config_ext(
-    crypto: &CryptoService,
-    plaintext: &str,
-) -> Result<String, PebbleError> {
-    let encrypted = crypto.encrypt_for(
-        TRANSLATE_CONFIG_PURPOSE,
-        ACTIVE_TRANSLATE_CONFIG_ID,
-        plaintext.as_bytes(),
-    )?;
-    Ok(hex::encode(encrypted))
-}
-
 // ─── 打包私有数据 ──────────────────────────────────────────────────────────
 
-fn collect_backup_secrets(
-    store: &Store,
-    crypto: &CryptoService,
-) -> Result<BackupSecrets, PebbleError> {
+fn collect_backup_secrets(state: &AppStateRef) -> Result<BackupSecrets, PebbleError> {
+    let store = &state.store;
+    let crypto = &state.crypto;
     let mut account_auth = Vec::new();
     for account in store.list_accounts()? {
         let Some(decrypted) = encrypted_store::load_account_auth_data(crypto, store, &account.id)?
@@ -137,7 +91,7 @@ fn collect_backup_secrets(
 
     let translate_config = store
         .get_translate_config()?
-        .map(|tc| decrypt_translate_config_ext(crypto, &tc.config))
+        .map(|tc| translate::decrypt_config(crypto, store, &tc.config))
         .transpose()?;
 
     Ok(BackupSecrets {
@@ -147,15 +101,14 @@ fn collect_backup_secrets(
 }
 
 fn attach_encrypted_secrets(
-    store: &Store,
-    crypto: &CryptoService,
+    state: &AppStateRef,
     backup: &mut SettingsBackup,
     secret_passphrase: Option<String>,
 ) -> Result<(), PebbleError> {
     let Some(passphrase) = secret_passphrase else {
         return Ok(());
     };
-    let secrets = collect_backup_secrets(store, crypto)?;
+    let secrets = collect_backup_secrets(state)?;
     if secrets.account_auth.is_empty() && secrets.translate_config.is_none() {
         return Ok(());
     }
@@ -192,7 +145,7 @@ fn decrypt_secrets_from_backup(
 }
 
 fn prepare_restored_private_data(
-    crypto: &CryptoService,
+    state: &AppStateRef,
     backup: &SettingsBackup,
     has_kanban_context_notes: bool,
     secrets: Option<BackupSecrets>,
@@ -200,12 +153,12 @@ fn prepare_restored_private_data(
     let mut private_data = RestoredPrivateData::default();
 
     if has_kanban_context_notes {
-        let notes = serde_json::to_vec(&backup.kanban_context_notes)
-            .map_err(|e| PebbleError::Internal(format!("Failed to serialize kanban notes: {e}")))?;
-        let encrypted = encrypt_secure_user_data(crypto, KANBAN_CONTEXT_NOTES_KEY, &notes)?;
         private_data.secure_user_data.push(RestoredSecureUserData {
-            key: KANBAN_CONTEXT_NOTES_KEY.to_string(),
-            encrypted: Some(encrypted),
+            key: kanban::KANBAN_CONTEXT_NOTES_KEY.to_string(),
+            encrypted: kanban::encrypt_kanban_context_notes_for_state(
+                state,
+                backup.kanban_context_notes.clone(),
+            )?,
         });
     }
 
@@ -220,8 +173,8 @@ fn prepare_restored_private_data(
                 account.account_id
             ))
         })?;
-        let encrypted = crypto.encrypt_for(
-            encrypted_store::ACCOUNT_AUTH_DATA_PURPOSE,
+        let encrypted = encrypted_store::encrypt_account_auth_data(
+            &state.crypto,
             &account.account_id,
             &auth_bytes,
         )?;
@@ -235,7 +188,7 @@ fn prepare_restored_private_data(
     if let (Some(secret_config), Some(mut translate_config)) =
         (secrets.translate_config, backup.translate_config.clone())
     {
-        translate_config.config = encrypt_translate_config_ext(crypto, &secret_config)?;
+        translate_config.config = translate::encrypt_config(&state.crypto, &secret_config)?;
         private_data.translate_config = Some(translate_config);
     }
 
@@ -252,13 +205,12 @@ pub(crate) fn build_backup_data(
     let exported = state.store.export_settings()?;
     let mut backup: SettingsBackup = serde_json::from_slice(&exported)
         .map_err(|e| PebbleError::Internal(format!("Failed to build backup payload: {e}")))?;
-    backup.kanban_context_notes = load_kanban_context_notes(&state.store, &state.crypto)?;
-    attach_encrypted_secrets(&state.store, &state.crypto, &mut backup, secret_passphrase)?;
+    backup.kanban_context_notes = kanban::load_kanban_context_notes_for_state(state)?;
+    attach_encrypted_secrets(state, &mut backup, secret_passphrase)?;
     serialize_backup(&backup)
 }
 
 /// 从备份字节流恢复设置（供 import_backup_file / restore_from_webdav 复用）。
-/// 备份加密密码错误统一归为 Validation（HTTP 400），避免触发 Web 会话登出。
 pub(crate) fn restore_backup_data(
     state: &AppStateRef,
     data: &[u8],
@@ -272,11 +224,10 @@ pub(crate) fn restore_backup_data(
     let backup: SettingsBackup = serde_json::from_value(backup_value)
         .map_err(|e| PebbleError::Validation(format!("Failed to parse backup: {e}")))?;
 
-    let backup_secrets = decrypt_secrets_from_backup(&backup, secret_passphrase)
-        .map_err(|e| PebbleError::Validation(format!("unable to decrypt backup secrets: {e}")))?;
+    let backup_secrets = decrypt_secrets_from_backup(&backup, secret_passphrase)?;
     let restored_secrets = backup_secrets.is_some();
     let private_data = prepare_restored_private_data(
-        &state.crypto,
+        state,
         &backup,
         has_kanban_context_notes,
         backup_secrets,
@@ -321,21 +272,4 @@ pub async fn import_backup_file(state: AppStateRef, args: Value) -> Result<Value
         .map_err(|e| ApiError::BadRequest(format!("invalid import_backup args: {e}")))?;
     let message = restore_backup_data(&state, args.data.as_bytes(), args.secret_passphrase)?;
     Ok(Value::String(message))
-}
-
-/// 读取 kanban 看板上下文笔记（来自 secure_user_data，DESKTOP 同款）。
-fn load_kanban_context_notes(
-    store: &Store,
-    crypto: &CryptoService,
-) -> Result<HashMap<String, String>, PebbleError> {
-    let Some(encrypted) = store.get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)? else {
-        return Ok(HashMap::new());
-    };
-    let decrypted = crypto.decrypt_for(
-        encrypted_store::SECURE_USER_DATA_PURPOSE,
-        KANBAN_CONTEXT_NOTES_KEY,
-        &encrypted,
-    )?;
-    serde_json::from_slice(&decrypted)
-        .map_err(|e| PebbleError::Internal(format!("Failed to parse kanban context notes: {e}")))
 }

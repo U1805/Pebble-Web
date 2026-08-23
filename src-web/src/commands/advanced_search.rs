@@ -5,11 +5,12 @@ use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-/// 高级搜索（字段过滤）。入参由调用层将前端 AdvancedSearchQuery（camelCase）
-/// 展开成顶层 snake_case 字段。
+/// 高级搜索（字段过滤）。顶层 command 参数由 Web transport 转为 snake_case，
+/// 嵌套 AdvancedSearchQuery 保持与 Tauri 相同的 camelCase Serde 契约。
 pub async fn advanced_search(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     // 与上游 Tauri 命令签名一致：advanced_search(query: AdvancedSearchQuery, limit)
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Query {
         #[serde(default)]
         text: Option<String>,
@@ -28,13 +29,15 @@ pub async fn advanced_search(state: AppStateRef, args: Value) -> Result<Value, A
         #[serde(default)]
         folder_id: Option<String>,
     }
-    let query: Query = serde_json::from_value(args.get("query").cloned().unwrap_or(Value::Null))
+    #[derive(serde::Deserialize)]
+    struct Args {
+        query: Query,
+        limit: Option<usize>,
+    }
+    let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid advanced_search args: {e}")))?;
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(50);
+    let query = args.query;
+    let limit = args.limit.unwrap_or(50);
     let search = state.search.clone();
     let hits = run_blocking(move || {
         search.advanced_search(AdvancedSearchParams {

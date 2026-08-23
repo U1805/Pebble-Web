@@ -3,48 +3,83 @@ use std::collections::HashMap;
 use pebble_core::{now_timestamp, KanbanCard, KanbanColumn, PebbleError};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
 
 use crate::blocking::run_blocking;
-use crate::commands::encrypted_store::SECURE_USER_DATA_PURPOSE;
+use crate::commands::encrypted_store::{
+    load_secure_user_data, lock_secure_user_data_key, store_secure_user_data,
+};
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-const KANBAN_CONTEXT_NOTES_KEY: &str = "kanban_context_notes";
-static KANBAN_CONTEXT_NOTES_LOCK: Mutex<()> = Mutex::const_new(());
+pub(crate) const KANBAN_CONTEXT_NOTES_KEY: &str = "kanban_context_notes";
 
 fn load_context_notes(
     store: &pebble_store::Store,
     crypto: &pebble_crypto::CryptoService,
 ) -> Result<HashMap<String, String>, PebbleError> {
-    let Some(encrypted) = store.get_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)? else {
+    let Some(plaintext) = load_secure_user_data(crypto, store, KANBAN_CONTEXT_NOTES_KEY)? else {
         return Ok(HashMap::new());
     };
-    let plaintext = crypto.decrypt_for(
-        SECURE_USER_DATA_PURPOSE,
-        KANBAN_CONTEXT_NOTES_KEY,
-        &encrypted,
-    )?;
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| PebbleError::Internal(format!("Failed to parse Kanban notes: {e}")))
+    serde_json::from_slice(&plaintext).map_err(|e| {
+        PebbleError::Internal(format!(
+            "Invalid secure user data for {KANBAN_CONTEXT_NOTES_KEY}: {e}"
+        ))
+    })
+}
+
+fn normalize_context_notes(notes: HashMap<String, String>) -> HashMap<String, String> {
+    notes
+        .into_iter()
+        .filter_map(|(message_id, note)| {
+            let message_id = message_id.trim().to_string();
+            if message_id.is_empty() || note.is_empty() {
+                None
+            } else {
+                Some((message_id, note))
+            }
+        })
+        .collect()
 }
 
 fn store_context_notes(
     store: &pebble_store::Store,
     crypto: &pebble_crypto::CryptoService,
-    notes: &HashMap<String, String>,
-) -> Result<(), PebbleError> {
+    notes: HashMap<String, String>,
+) -> Result<HashMap<String, String>, PebbleError> {
+    let notes = normalize_context_notes(notes);
     if notes.is_empty() {
-        return store.delete_secure_user_data(KANBAN_CONTEXT_NOTES_KEY);
+        store.delete_secure_user_data(KANBAN_CONTEXT_NOTES_KEY)?;
+    } else {
+        let plaintext = serde_json::to_vec(&notes).map_err(|e| {
+            PebbleError::Internal(format!("Failed to serialize secure user data: {e}"))
+        })?;
+        store_secure_user_data(crypto, store, KANBAN_CONTEXT_NOTES_KEY, &plaintext)?;
     }
-    let plaintext = serde_json::to_vec(notes)
-        .map_err(|e| PebbleError::Internal(format!("Failed to serialize Kanban notes: {e}")))?;
-    let encrypted = crypto.encrypt_for(
-        SECURE_USER_DATA_PURPOSE,
+    Ok(notes)
+}
+
+pub(crate) fn load_kanban_context_notes_for_state(
+    state: &AppStateRef,
+) -> Result<HashMap<String, String>, PebbleError> {
+    load_context_notes(&state.store, &state.crypto)
+}
+
+pub(crate) fn encrypt_kanban_context_notes_for_state(
+    state: &AppStateRef,
+    notes: HashMap<String, String>,
+) -> Result<Option<Vec<u8>>, PebbleError> {
+    let notes = normalize_context_notes(notes);
+    if notes.is_empty() {
+        return Ok(None);
+    }
+    let plaintext = serde_json::to_vec(&notes)
+        .map_err(|e| PebbleError::Internal(format!("Failed to serialize secure user data: {e}")))?;
+    crate::commands::encrypted_store::encrypt_secure_user_data(
+        &state.crypto,
         KANBAN_CONTEXT_NOTES_KEY,
         &plaintext,
-    )?;
-    store.set_secure_user_data(KANBAN_CONTEXT_NOTES_KEY, &encrypted)
+    )
+    .map(Some)
 }
 
 pub async fn move_to_kanban(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
@@ -113,7 +148,7 @@ pub async fn set_kanban_context_note(state: AppStateRef, args: Value) -> Result<
     }
     let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid set_kanban_context_note args: {e}")))?;
-    let _guard = KANBAN_CONTEXT_NOTES_LOCK.lock().await;
+    let _guard = lock_secure_user_data_key(&state, KANBAN_CONTEXT_NOTES_KEY).await;
     let store = state.store.clone();
     let crypto = state.crypto.clone();
     let notes = run_blocking(move || {
@@ -124,8 +159,7 @@ pub async fn set_kanban_context_note(state: AppStateRef, args: Value) -> Result<
         } else {
             notes.insert(message_id, args.note);
         }
-        store_context_notes(&store, &crypto, &notes)?;
-        Ok(notes)
+        store_context_notes(&store, &crypto, notes)
     })
     .await?;
     serde_json::to_value(notes).map_err(ApiError::from_serialize)
@@ -142,19 +176,15 @@ pub async fn merge_kanban_context_notes(
     let args: Args = serde_json::from_value(args).map_err(|e| {
         ApiError::BadRequest(format!("invalid merge_kanban_context_notes args: {e}"))
     })?;
-    let _guard = KANBAN_CONTEXT_NOTES_LOCK.lock().await;
+    let _guard = lock_secure_user_data_key(&state, KANBAN_CONTEXT_NOTES_KEY).await;
     let store = state.store.clone();
     let crypto = state.crypto.clone();
     let notes = run_blocking(move || {
         let mut current = load_context_notes(&store, &crypto)?;
-        for (message_id, note) in args.notes {
-            let message_id = message_id.trim().to_string();
-            if !message_id.is_empty() && !note.is_empty() {
-                current.entry(message_id).or_insert(note);
-            }
+        for (message_id, note) in normalize_context_notes(args.notes) {
+            current.entry(message_id).or_insert(note);
         }
-        store_context_notes(&store, &crypto, &current)?;
-        Ok(current)
+        store_context_notes(&store, &crypto, current)
     })
     .await?;
     serde_json::to_value(notes).map_err(ApiError::from_serialize)

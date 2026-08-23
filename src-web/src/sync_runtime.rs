@@ -1,41 +1,99 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pebble_core::{Account, PebbleError, ProviderType};
 use pebble_crypto::CryptoService;
 use pebble_mail::{
     GmailProvider, GmailSyncWorker, ImapMailProvider, OutlookProvider, OutlookSyncWorker,
-    Pop3Provider, Pop3SyncWorker, SyncConfig, SyncWorker,
+    Pop3Provider, Pop3SyncWorker, SyncConfig, SyncRuntimeStatus, SyncTrigger, SyncWorker,
 };
 use pebble_search::TantivySearch;
 use pebble_store::Store;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
-use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-/// Web 端同步管理器。
+use crate::events;
+use crate::state::OAuthAccountLockRegistry;
+
+const WEB_REALTIME_INTERVAL_KEY: &str = "web_realtime_interval_secs";
+
+fn initial_poll_interval(
+    crypto: &pebble_crypto::CryptoService,
+    store: &Store,
+    fallback: u64,
+) -> u64 {
+    let fallback = if fallback == 0 { 0 } else { fallback.max(10) };
+    match crate::commands::encrypted_store::load_secure_user_data(
+        crypto,
+        store,
+        WEB_REALTIME_INTERVAL_KEY,
+    ) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<u64>(&bytes) {
+            Ok(interval) => interval,
+            Err(error) => {
+                warn!("Ignoring invalid persisted Web realtime preference: {error}");
+                fallback
+            }
+        },
+        Ok(None) => fallback,
+        Err(error) => {
+            warn!("Failed to load persisted Web realtime preference: {error}");
+            fallback
+        }
+    }
+}
+
+fn persist_poll_interval(
+    crypto: &pebble_crypto::CryptoService,
+    store: &Store,
+    interval: u64,
+) -> Result<(), PebbleError> {
+    let bytes = serde_json::to_vec(&interval)
+        .map_err(|error| PebbleError::Internal(format!("Failed to serialize realtime preference: {error}")))?;
+    crate::commands::encrypted_store::store_secure_user_data(
+        crypto,
+        store,
+        WEB_REALTIME_INTERVAL_KEY,
+        &bytes,
+    )
+}
+
+struct SyncHandle {
+    stop_tx: watch::Sender<bool>,
+    trigger_tx: mpsc::UnboundedSender<SyncTrigger>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_sync_start_placeholder(
+    stop_rx: watch::Receiver<bool>,
+    trigger_rx: mpsc::UnboundedReceiver<SyncTrigger>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _keepalive = (stop_rx, trigger_rx);
+        std::future::pending::<()>().await;
+    })
+}
+
+/// Long-lived Web sync runtime.
 ///
-/// 设计（2026-08-19）：服务端定时对全部账户做单轮同步（manual_only 语义，
-/// 每轮同步完即断开连接，适合长驻服务器进程）；手动触发走同一路径立即执行。
-/// 每账户防重入（running 标记），同步进度/结果通过 ws_broadcast 广播 JSON 事件
-/// （阶段 4.7 统一事件命名，此处先发结构化文本）。新同步的消息注入搜索索引。
+/// The lifecycle mirrors the desktop adapter: each account owns one worker
+/// handle with independent stop/trigger channels. Shared `pebble-mail`
+/// workers retain their provider-specific polling/backoff behavior and IMAP
+/// can promote itself to IDLE when the server advertises that capability.
 pub struct SyncManager {
     store: Arc<Store>,
     search: Arc<TantivySearch>,
     crypto: Arc<CryptoService>,
     oauth_account_locks: OAuthAccountLockRegistry,
     attachments_dir: PathBuf,
-    poll_interval_secs: watch::Sender<u64>,
+    preferred_poll_interval_secs: AtomicU64,
     ws_broadcast: broadcast::Sender<String>,
-    running: Mutex<HashMap<String, bool>>,
-    stop_signals: Mutex<HashMap<String, watch::Sender<bool>>>,
+    handles: Mutex<HashMap<String, SyncHandle>>,
 }
-
-use crate::events;
-use crate::state::OAuthAccountLockRegistry;
 
 impl SyncManager {
     pub fn new(
@@ -47,555 +105,584 @@ impl SyncManager {
         sync_interval_secs: u64,
         ws_broadcast: broadcast::Sender<String>,
     ) -> Self {
-        let initial_interval = sync_interval_secs.max(10);
-        let (poll_interval_secs, _) = watch::channel(initial_interval);
+        let preferred_poll_interval_secs =
+            initial_poll_interval(&crypto, &store, sync_interval_secs);
         Self {
             store,
             search,
             crypto,
             oauth_account_locks,
             attachments_dir,
-            poll_interval_secs,
+            preferred_poll_interval_secs: AtomicU64::new(preferred_poll_interval_secs),
             ws_broadcast,
-            running: Mutex::new(HashMap::new()),
-            stop_signals: Mutex::new(HashMap::new()),
+            handles: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Change the scheduler interval without restarting the Web service.
-    /// A value of zero disables automatic synchronization (manual mode).
-    pub fn set_poll_interval_secs(&self, seconds: u64) {
-        let _ = self.poll_interval_secs.send(seconds);
+    pub fn preferred_poll_interval_secs(&self) -> u64 {
+        self.preferred_poll_interval_secs.load(Ordering::Relaxed)
     }
 
-    /// Publish the account status snapshot after a preference change without
-    /// blocking the async command thread on SQLite I/O.
-    pub async fn publish_realtime_preference_status(&self, seconds: u64) {
-        // Keep the account-status event in sync with the preference change.
-        // This is deliberately best-effort: changing the scheduler must not
-        // fail merely because the status snapshot could not be read.
-        let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || store.list_accounts()).await {
-            Ok(Ok(accounts)) => {
-                let mode = realtime_mode_for_interval(seconds);
-                let message = realtime_status_message(seconds);
-                for account in accounts {
-                    self.emit_realtime_status(&account, mode, None, None, Some(message.clone()));
-                }
-            }
-            Ok(Err(error)) => warn!("Failed to publish realtime preference status: {error}"),
-            Err(error) => warn!("Realtime preference status task failed: {error}"),
-        }
-    }
-
-    fn poll_interval_secs(&self) -> u64 {
-        *self.poll_interval_secs.borrow()
-    }
-
-    /// Request cancellation of an in-flight account sync. Workers all share
-    /// this watch channel and observe it between network operations.
-    pub async fn stop_account(&self, account_id: &str) -> bool {
-        let sender = self.stop_signals.lock().await.get(account_id).cloned();
-        sender.is_some_and(|sender| sender.send(true).is_ok())
-    }
-
-    /// Stop an account and wait until its worker has released the running
-    /// slot. A bounded wait prevents account deletion from hanging forever if
-    /// an upstream provider ignores cancellation while a socket is blocked.
-    pub async fn stop_account_and_wait(&self, account_id: &str, timeout: Duration) -> bool {
-        let _ = self.stop_account(account_id).await;
-        tokio::time::timeout(timeout, async {
-            loop {
-                if !self
-                    .running
-                    .lock()
-                    .await
-                    .get(account_id)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .is_ok()
-    }
-
-    /// 启动定时同步循环（main 启动时调用一次）。
+    /// Auto-resume one long-lived worker for every account after startup
+    /// recovery has completed.
     pub fn spawn(self: &Arc<Self>) {
-        let mgr = self.clone();
+        let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let mut poll_rx = mgr.poll_interval_secs.subscribe();
-            if *poll_rx.borrow() > 0 {
-                mgr.sync_all().await;
-            }
-            let mut next_sync =
-                Box::pin(tokio::time::sleep(sync_sleep_duration(*poll_rx.borrow())));
-            loop {
-                tokio::select! {
-                    _ = &mut next_sync => {
-                        if *poll_rx.borrow() > 0 {
-                            mgr.sync_all().await;
-                        }
-                        next_sync.as_mut().reset(Instant::now() + sync_sleep_duration(*poll_rx.borrow()));
-                    }
-                    changed = poll_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        next_sync.as_mut().reset(Instant::now() + sync_sleep_duration(*poll_rx.borrow()));
-                    }
+            let accounts = match manager.store.list_accounts() {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    warn!("Failed to list accounts for auto-sync: {error}");
+                    return;
                 }
-            }
-        });
-
-        tokio::spawn(crate::snooze_watcher::run_snooze_watcher(
-            self.store.clone(),
-            self.ws_broadcast.clone(),
-        ));
-    }
-
-
-    /// 同步全部账户（间隔触发）。
-    pub async fn sync_all(&self) {
-        let accounts = match self.store.list_accounts() {
-            Ok(a) => a,
-            Err(e) => {
-                error!("SyncManager: failed to list accounts: {e}");
+            };
+            let interval = manager.preferred_poll_interval_secs();
+            if interval == 0 {
+                for account in accounts {
+                    manager.emit_realtime_status(
+                        &account,
+                        "manual",
+                        None,
+                        None,
+                        Some("Manual only".to_string()),
+                    );
+                }
                 return;
             }
-        };
-        for account in accounts {
-            if let Err(e) = self.sync_account(&account).await {
-                warn!("Sync failed for account {}: {e}", account.id);
-            }
-        }
-    }
-
-    /// 同步单个账户（防重入）。
-    pub async fn sync_account(&self, account: &Account) -> Result<(), PebbleError> {
-        let (stop_tx, stop_rx) = watch::channel(false);
-        {
-            let mut running = self.running.lock().await;
-            if running.get(&account.id).copied().unwrap_or(false) {
-                return Ok(());
-            }
-            self.stop_signals
-                .lock()
-                .await
-                .insert(account.id.clone(), stop_tx);
-            running.insert(account.id.clone(), true);
-        }
-
-        let interval = self.poll_interval_secs();
-        self.emit_realtime_status(
-            account,
-            realtime_mode_for_interval(interval),
-            None,
-            None,
-            Some(realtime_status_message(interval)),
-        );
-
-        let result = self.sync_account_inner(account, stop_rx).await;
-
-        match &result {
-            Ok(()) => self.emit_realtime_status(
-                account,
-                realtime_mode_for_interval(interval),
-                Some(pebble_core::now_timestamp()),
-                None,
-                Some(realtime_status_message(interval)),
-            ),
-            Err(error) => {
-                self.emit_realtime_status(account, "error", None, None, Some(error.to_string()))
-            }
-        }
-
-        self.stop_signals.lock().await.remove(&account.id);
-        let mut running = self.running.lock().await;
-        running.remove(&account.id);
-        result
-    }
-
-    async fn sync_account_inner(
-        &self,
-        account: &Account,
-        stop_rx: watch::Receiver<bool>,
-    ) -> Result<(), PebbleError> {
-        match account.provider {
-            ProviderType::Imap => {
-                info!("sync start: account {} (imap)", account.id);
-                self.emit(
-                    events::MAIL_SYNC_PROGRESS,
-                    &account.id,
-                    json!({
-                        "status": "started",
-                        "phase": "initial",
-                    }),
-                );
-
-                let imap_config = crate::commands::messages::load_imap_config(&self.store, &self.crypto, &account.id)?;
-                let provider = Arc::new(ImapMailProvider::new(imap_config));
-
-                let (error_tx, mut error_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<pebble_mail::SyncError>();
-                let (message_tx, mut message_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
-                let (progress_tx, mut progress_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
-
-                let broadcast = self.ws_broadcast.clone();
-                let account_id = account.id.clone();
-                let provider_slug = provider_slug(&account.provider).to_string();
-                let search = self.search.clone();
-                let store = self.store.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            Some(err) = error_rx.recv() => {
-                                let error_mode = realtime_error_mode(&err);
-                                let error_message = err.message.clone();
-                                let _ = broadcast.send(json!({
-                                    "type": events::MAIL_ERROR,
-                                    "account_id": account_id,
-                                    "payload": json!({
-                                        "message": err.message,
-                                        "error_type": err.error_type,
-                                    }),
-                                }).to_string());
-                                let _ = broadcast.send(json!({
-                                    "type": events::MAIL_REALTIME_STATUS,
-                                    "account_id": account_id,
-                                    "payload": realtime_status_payload(
-                                        &account_id,
-                                        &provider_slug,
-                                        error_mode,
-                                        None,
-                                        None,
-                                        Some(error_message),
-                                    ),
-                                }).to_string());
-                            }
-                            Some(stored) = message_rx.recv() => {
-                                // 非 reconciliation 的新消息 → 发 mail:new 事件（对齐桌面端 indexing 语义，
-                                // payload 结构一致：account_id/message_id/folder_ids）
-                                if !stored.reconciliation {
-                                    let payload = json!({
-                                        "account_id": stored.message.account_id,
-                                        "message_id": stored.message.id,
-                                        "folder_ids": stored.folder_ids,
-                                        "thread_id": stored.message.thread_id,
-                                        "subject": stored.message.subject,
-                                        "from": stored.message.from_address,
-                                        "received_at": stored.message.date,
-                                    });
-                                    let _ = broadcast.send(json!({
-                                        "type": events::MAIL_NEW,
-                                        "account_id": stored.message.account_id,
-                                        "payload": payload,
-                                    }).to_string());
-                                }
-                                crate::commands::indexing::index_stored_message(&search, &store, &stored).await;
-                            }
-                            Some(progress) = progress_rx.recv() => {
-                                let _ = broadcast.send(json!({
-                                    "type": events::MAIL_SYNC_PROGRESS,
-                                    "account_id": progress.account_id,
-                                    "payload": json!({
-                                        "status": progress.status,
-                                        "phase": progress.phase,
-                                        "message": progress.message,
-                                    }),
-                                }).to_string());
-                            }
-                            else => break,
-                        }
-                    }
-                });
-
-                let mut config = SyncConfig::default();
-                config.poll_interval_secs = 0; // manual_only：单轮同步后断开
-                config.reconcile_interval_secs = 86400;
-
-                let worker = SyncWorker::new(
-                    account.id.clone(),
-                    provider,
-                    self.store.clone(),
-                    stop_rx,
-                    &self.attachments_dir,
-                )
-                .with_error_tx(error_tx)
-                .with_message_tx(message_tx)
-                .with_progress_tx(progress_tx);
-
-                worker.run(config, None).await;
-
-                self.emit(
-                    events::MAIL_SYNC_COMPLETE,
-                    &account.id,
-                    json!({
-                        "status": "completed",
-                        "phase": "initial",
-                    }),
-                );
-                info!("sync done: account {}", account.id);
-                Ok(())
-            }
-            ProviderType::Gmail | ProviderType::Outlook => {
-                self.sync_oauth_account(account, stop_rx).await
-            }
-            ProviderType::Pop3 => self.sync_pop3_account(account, stop_rx).await,
-        }
-    }
-
-    /// Run one manual Gmail/Outlook worker pass. The workers are shared with
-    /// the desktop transport; Web only supplies server-side token loading,
-    /// refresh persistence, and event forwarding.
-    async fn sync_oauth_account(
-        &self,
-        account: &Account,
-        stop_rx: watch::Receiver<bool>,
-    ) -> Result<(), PebbleError> {
-        let access = crate::oauth::load_oauth_access(&self.crypto, &self.store, &account.id)?;
-        let refresher = crate::oauth::build_oauth_token_refresher(
-            self.crypto.clone(),
-            self.store.clone(),
-            match account.provider {
-                ProviderType::Gmail => "gmail",
-                ProviderType::Outlook => "outlook",
-                _ => unreachable!(),
-            },
-            &access,
-            self.oauth_account_locks.clone(),
-            &account.id,
-        )?;
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel::<pebble_mail::SyncError>();
-        let (message_tx, mut message_rx) = mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
-        let broadcast = self.ws_broadcast.clone();
-        let account_id = account.id.clone();
-        let provider_slug = provider_slug(&account.provider).to_string();
-        let search = self.search.clone();
-        let store = self.store.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(err) = error_rx.recv() => {
-                        let error_mode = realtime_error_mode(&err);
-                        let error_message = err.message.clone();
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_ERROR,
-                            "account_id": account_id,
-                            "payload": {"message": err.message, "error_type": err.error_type},
-                        }).to_string());
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_REALTIME_STATUS,
-                            "account_id": account_id,
-                            "payload": realtime_status_payload(
-                                &account_id,
-                                &provider_slug,
-                                error_mode,
-                                None,
-                                None,
-                                Some(error_message),
-                            ),
-                        }).to_string());
-                    }
-                    Some(stored) = message_rx.recv() => {
-                        if !stored.reconciliation {
-                            let payload = json!({
-                                "account_id": stored.message.account_id,
-                                "message_id": stored.message.id,
-                                "folder_ids": stored.folder_ids,
-                                "thread_id": stored.message.thread_id,
-                                "subject": stored.message.subject,
-                                "from": stored.message.from_address,
-                                "received_at": stored.message.date,
-                            });
-                            let _ = broadcast.send(json!({
-                                "type": events::MAIL_NEW,
-                                "account_id": stored.message.account_id,
-                                "payload": payload,
-                            }).to_string());
-                        }
-                        crate::commands::indexing::index_stored_message(&search, &store, &stored).await;
-                    }
-                    Some(progress) = progress_rx.recv() => {
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_SYNC_PROGRESS,
-                            "account_id": progress.account_id,
-                            "payload": {
-                                "status": progress.status,
-                                "phase": progress.phase,
-                                "message": progress.message,
-                            },
-                        }).to_string());
-                    }
-                    else => break,
+            for account in accounts {
+                if let Err(error) = manager
+                    .start_account(account.id.clone(), Some(interval))
+                    .await
+                {
+                    warn!(
+                        account_id = %account.id,
+                        "Failed to auto-resume sync: {error}"
+                    );
                 }
             }
         });
+    }
 
-        let mut config = SyncConfig::default();
-        config.poll_interval_secs = 0;
-        config.reconcile_interval_secs = 86400;
-        match account.provider {
-            ProviderType::Gmail => {
-                let provider = Arc::new(GmailProvider::new_with_proxy(
-                    access.access_token.clone(),
-                    access.proxy.clone(),
-                )?);
-                let mut worker = GmailSyncWorker::new(
-                    account.id.clone(),
-                    provider,
-                    self.store.clone(),
-                    stop_rx,
-                    &self.attachments_dir,
-                )
-                .with_error_tx(error_tx)
-                .with_message_tx(message_tx)
-                .with_progress_tx(progress_tx);
-                if let Some(refresher) = refresher {
-                    worker = worker.with_token_refresher(refresher, access.expires_at);
+    pub async fn start_account(
+        self: &Arc<Self>,
+        account_id: String,
+        poll_interval_secs: Option<u64>,
+    ) -> Result<(), PebbleError> {
+        {
+            let mut handles = self.handles.lock().await;
+            if let Some(existing) = handles.get(&account_id) {
+                if !existing.task.is_finished() {
+                    return Ok(());
                 }
-                worker.run(config, None).await;
+                handles.remove(&account_id);
+            }
+
+            let (placeholder_stop_tx, placeholder_stop_rx) = watch::channel(false);
+            let (placeholder_trigger_tx, placeholder_trigger_rx) = mpsc::unbounded_channel();
+            let placeholder_task =
+                spawn_sync_start_placeholder(placeholder_stop_rx, placeholder_trigger_rx);
+            handles.insert(
+                account_id.clone(),
+                SyncHandle {
+                    stop_tx: placeholder_stop_tx,
+                    trigger_tx: placeholder_trigger_tx,
+                    task: placeholder_task,
+                },
+            );
+        }
+
+        let account = match self.store.get_account(&account_id) {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                self.remove_placeholder(&account_id).await;
+                return Err(PebbleError::Internal(format!(
+                    "Account not found: {account_id}"
+                )));
+            }
+            Err(error) => {
+                self.remove_placeholder(&account_id).await;
+                return Err(error);
+            }
+        };
+
+        let interval = poll_interval_secs.unwrap_or_else(|| self.preferred_poll_interval_secs());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+
+        let task = match self.build_sync_task(account, stop_rx, trigger_rx, interval) {
+            Ok(task) => task,
+            Err(error) => {
+                self.remove_placeholder(&account_id).await;
+                return Err(error);
+            }
+        };
+
+        let mut handles = self.handles.lock().await;
+        if let Some(previous) = handles.insert(
+            account_id,
+            SyncHandle {
+                stop_tx,
+                trigger_tx,
+                task,
+            },
+        ) {
+            previous.task.abort();
+        }
+        Ok(())
+    }
+
+    async fn remove_placeholder(&self, account_id: &str) {
+        let mut handles = self.handles.lock().await;
+        if let Some(handle) = handles.remove(account_id) {
+            handle.task.abort();
+        }
+    }
+
+    pub async fn trigger_account(
+        self: &Arc<Self>,
+        account_id: &str,
+        reason: &str,
+    ) -> Result<(), PebbleError> {
+        let trigger = SyncTrigger::from_reason(reason);
+        let should_start_one_shot = {
+            let mut handles = self.handles.lock().await;
+            match handles.get(account_id) {
+                Some(handle) if handle.task.is_finished() => {
+                    handles.remove(account_id);
+                    true
+                }
+                Some(handle) => {
+                    let send_failed = handle.trigger_tx.send(trigger).is_err();
+                    if send_failed {
+                        warn!(
+                            "Sync trigger channel was already closed for account {}",
+                            account_id
+                        );
+                        handles.remove(account_id);
+                    }
+                    send_failed
+                }
+                None => true,
+            }
+        };
+
+        if should_start_one_shot {
+            self.start_account(account_id.to_string(), Some(0)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn stop_account(&self, account_id: &str) -> bool {
+        let mut handles = self.handles.lock().await;
+        let Some(handle) = handles.remove(account_id) else {
+            return false;
+        };
+        if !handle.task.is_finished() {
+            let _ = handle.stop_tx.send(true);
+            handle.task.abort();
+        }
+        true
+    }
+
+    pub async fn apply_realtime_preference(
+        self: &Arc<Self>,
+        interval: u64,
+    ) -> Result<(), PebbleError> {
+        let accounts = self.store.list_accounts()?;
+        persist_poll_interval(&self.crypto, &self.store, interval)?;
+        self.preferred_poll_interval_secs
+            .store(interval, Ordering::Relaxed);
+        let running_ids = {
+            let handles = self.handles.lock().await;
+            handles.keys().cloned().collect::<Vec<_>>()
+        };
+        for account_id in running_ids {
+            let _ = self.stop_account(&account_id).await;
+        }
+
+        if interval == 0 {
+            for account in accounts {
+                self.emit_realtime_status(
+                    &account,
+                    "manual",
+                    None,
+                    None,
+                    Some("Manual only".to_string()),
+                );
+            }
+            return Ok(());
+        }
+
+        let mut started_count = 0usize;
+        let mut failures = Vec::new();
+        for account in accounts {
+            match self
+                .start_account(account.id.clone(), Some(interval))
+                .await
+            {
+                Ok(()) => started_count += 1,
+                Err(error) => failures.push((account.id, error.to_string())),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(PebbleError::Internal(format!(
+                "Realtime preference applied with {} account start failure(s); {} account(s) started; failures: {}",
+                failures.len(),
+                started_count,
+                failures
+                    .into_iter()
+                    .map(|(id, error)| format!("{id}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )))
+        }
+    }
+
+    fn build_sync_task(
+        self: &Arc<Self>,
+        account: Account,
+        stop_rx: watch::Receiver<bool>,
+        trigger_rx: mpsc::UnboundedReceiver<SyncTrigger>,
+        poll_interval_secs: u64,
+    ) -> Result<tokio::task::JoinHandle<()>, PebbleError> {
+        let account_id = account.id.clone();
+        let (error_tx, progress_tx, message_tx) = self.spawn_event_forwarders(&account);
+        let store = Arc::clone(&self.store);
+        let attachments_dir = self.attachments_dir.clone();
+        let broadcast = self.ws_broadcast.clone();
+
+        let task = match account.provider {
+            ProviderType::Gmail => {
+                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(&self.crypto, &self.store, &account_id)
+                    .map_err(|error| {
+                        emit_realtime_status_to(
+                            &broadcast,
+                            &account_id,
+                            &ProviderType::Gmail,
+                            "auth_required",
+                            None,
+                            None,
+                            Some(error.to_string()),
+                        );
+                        error
+                    })?;
+                let expires_at = tokens.expires_at;
+                let provider = Arc::new(GmailProvider::new_with_proxy(
+                    tokens.access_token.clone(),
+                    tokens.proxy.clone(),
+                )?);
+                let refresher = crate::commands::oauth::build_oauth_token_refresher(
+                    crate::commands::oauth::gmail_oauth_config(),
+                    tokens.refresh_token,
+                    tokens.access_token,
+                    Arc::clone(&self.crypto),
+                    Arc::clone(&self.store),
+                    Arc::clone(&self.oauth_account_locks),
+                    account_id.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut config = SyncConfig::default();
+                    config.poll_interval_secs = poll_interval_secs;
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Gmail,
+                        "polling",
+                        Some(now_timestamp_secs()),
+                        None,
+                        Some(polling_status_message(&config)),
+                    );
+                    let mut worker = GmailSyncWorker::new(
+                        account_id.clone(),
+                        provider,
+                        store,
+                        stop_rx,
+                        attachments_dir,
+                    )
+                    .with_error_tx(error_tx)
+                    .with_message_tx(message_tx)
+                    .with_progress_tx(progress_tx);
+                    worker = worker.with_token_refresher(refresher, expires_at);
+                    worker.run(config, Some(trigger_rx)).await;
+                    emit_sync_complete_to(&broadcast, &account_id);
+                    info!("Gmail sync task completed for account {}", account_id);
+                })
             }
             ProviderType::Outlook => {
+                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(&self.crypto, &self.store, &account_id)
+                    .map_err(|error| {
+                        emit_realtime_status_to(
+                            &broadcast,
+                            &account_id,
+                            &ProviderType::Outlook,
+                            "auth_required",
+                            None,
+                            None,
+                            Some(error.to_string()),
+                        );
+                        error
+                    })?;
+                let expires_at = tokens.expires_at;
                 let provider = Arc::new(OutlookProvider::new_with_proxy(
-                    access.access_token.clone(),
-                    account.id.clone(),
-                    access.proxy.clone(),
+                    tokens.access_token.clone(),
+                    account_id.clone(),
+                    tokens.proxy.clone(),
                 )?);
-                let mut worker = OutlookSyncWorker::new(
-                    account.id.clone(),
-                    provider,
-                    self.store.clone(),
-                    &self.attachments_dir,
-                )
-                .with_error_tx(error_tx)
-                .with_message_tx(message_tx)
-                .with_progress_tx(progress_tx);
-                if let Some(refresher) = refresher {
-                    worker = worker.with_token_refresher(refresher, access.expires_at);
-                }
-                worker.run(config, stop_rx, None).await;
+                let refresher = crate::commands::oauth::build_oauth_token_refresher(
+                    crate::commands::oauth::outlook_oauth_config(),
+                    tokens.refresh_token,
+                    tokens.access_token,
+                    Arc::clone(&self.crypto),
+                    Arc::clone(&self.store),
+                    Arc::clone(&self.oauth_account_locks),
+                    account_id.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut config = SyncConfig::default();
+                    config.poll_interval_secs = poll_interval_secs;
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Outlook,
+                        "polling",
+                        Some(now_timestamp_secs()),
+                        None,
+                        Some(polling_status_message(&config)),
+                    );
+                    let mut worker = OutlookSyncWorker::new(
+                        account_id.clone(),
+                        provider,
+                        store,
+                        attachments_dir,
+                    )
+                    .with_error_tx(error_tx)
+                    .with_message_tx(message_tx)
+                    .with_progress_tx(progress_tx);
+                    worker = worker.with_token_refresher(refresher, expires_at);
+                    worker.run(config, stop_rx, Some(trigger_rx)).await;
+                    emit_sync_complete_to(&broadcast, &account_id);
+                    info!("Outlook sync task completed for account {}", account_id);
+                })
             }
-            _ => unreachable!(),
-        }
-        self.emit(
-            events::MAIL_SYNC_COMPLETE,
-            &account.id,
-            json!({"status": "completed", "phase": "oauth"}),
-        );
-        Ok(())
+            ProviderType::Pop3 => {
+                let pop3_config = crate::commands::messages::load_pop3_config(
+                    &self.store,
+                    &self.crypto,
+                    &account_id,
+                )
+                .map_err(|error| {
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Pop3,
+                        "error",
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    );
+                    error
+                })?;
+                let provider = Arc::new(Pop3Provider::new(pop3_config));
+                tokio::spawn(async move {
+                    let mut config = SyncConfig::default();
+                    config.poll_interval_secs = poll_interval_secs;
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Pop3,
+                        if config.manual_only() { "manual" } else { "polling" },
+                        Some(now_timestamp_secs()),
+                        None,
+                        Some(polling_status_message(&config)),
+                    );
+                    let worker = Pop3SyncWorker::new(
+                        account_id.clone(),
+                        provider,
+                        store,
+                        stop_rx,
+                        attachments_dir,
+                    )
+                    .with_error_tx(error_tx)
+                    .with_message_tx(message_tx)
+                    .with_progress_tx(progress_tx);
+                    worker.run(config, Some(trigger_rx)).await;
+                    emit_sync_complete_to(&broadcast, &account_id);
+                    info!("POP3 sync task completed for account {}", account_id);
+                })
+            }
+            ProviderType::Imap => {
+                let imap_config = crate::commands::messages::load_imap_config(
+                    &self.store,
+                    &self.crypto,
+                    &account_id,
+                )
+                .map_err(|error| {
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Imap,
+                        "error",
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    );
+                    error
+                })?;
+                let provider = Arc::new(ImapMailProvider::new(imap_config));
+                tokio::spawn(async move {
+                    let mut config = SyncConfig::default();
+                    config.poll_interval_secs = poll_interval_secs;
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Imap,
+                        if config.manual_only() { "manual" } else { "polling" },
+                        Some(now_timestamp_secs()),
+                        None,
+                        Some(polling_status_message(&config)),
+                    );
+                    let (runtime_status_tx, mut runtime_status_rx) = mpsc::unbounded_channel();
+                    let status_broadcast = broadcast.clone();
+                    let status_account_id = account_id.clone();
+                    let status_config = config.clone();
+                    tokio::spawn(async move {
+                        while let Some(status) = runtime_status_rx.recv().await {
+                            let supports_idle =
+                                matches!(status, SyncRuntimeStatus::ImapIdleAvailable);
+                            emit_realtime_status_to(
+                                &status_broadcast,
+                                &status_account_id,
+                                &ProviderType::Imap,
+                                if status_config.manual_only() {
+                                    "manual"
+                                } else if supports_idle {
+                                    "realtime"
+                                } else {
+                                    "polling"
+                                },
+                                Some(now_timestamp_secs()),
+                                None,
+                                if supports_idle {
+                                    None
+                                } else {
+                                    Some(polling_status_message(&status_config))
+                                },
+                            );
+                        }
+                    });
+                    let worker = SyncWorker::new(
+                        account_id.clone(),
+                        provider,
+                        store,
+                        stop_rx,
+                        attachments_dir,
+                    )
+                    .with_error_tx(error_tx)
+                    .with_message_tx(message_tx)
+                    .with_progress_tx(progress_tx)
+                    .with_runtime_status_tx(runtime_status_tx);
+                    worker.run(config, Some(trigger_rx)).await;
+                    emit_sync_complete_to(&broadcast, &account_id);
+                    info!("IMAP sync task completed for account {}", account_id);
+                })
+            }
+        };
+        Ok(task)
     }
 
-    async fn sync_pop3_account(
+    fn spawn_event_forwarders(
         &self,
         account: &Account,
-        stop_rx: watch::Receiver<bool>,
-    ) -> Result<(), PebbleError> {
-        let config = crate::commands::messages::load_pop3_config(&self.store, &self.crypto, &account.id)?;
-        let provider = Arc::new(Pop3Provider::new(config));
+    ) -> (
+        mpsc::UnboundedSender<pebble_mail::SyncError>,
+        mpsc::UnboundedSender<pebble_mail::SyncProgress>,
+        mpsc::UnboundedSender<pebble_mail::StoredMessage>,
+    ) {
         let (error_tx, mut error_rx) = mpsc::unbounded_channel::<pebble_mail::SyncError>();
-        let (message_tx, mut message_rx) = mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
+        let (progress_tx, mut progress_rx) =
+            mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
+        let (message_tx, mut message_rx) =
+            mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
         let broadcast = self.ws_broadcast.clone();
         let account_id = account.id.clone();
-        let provider_slug = provider_slug(&account.provider).to_string();
-        let search = self.search.clone();
-        let store = self.store.clone();
+        let provider = account.provider.clone();
+        let search = Arc::clone(&self.search);
+        let store = Arc::clone(&self.store);
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some(err) = error_rx.recv() => {
-                        let error_mode = realtime_error_mode(&err);
-                        let error_message = err.message.clone();
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_ERROR,
-                            "account_id": account_id,
-                            "payload": {"message": err.message, "error_type": err.error_type},
-                        }).to_string());
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_REALTIME_STATUS,
-                            "account_id": account_id,
-                            "payload": realtime_status_payload(
-                                &account_id,
-                                &provider_slug,
-                                error_mode,
-                                None,
-                                None,
-                                Some(error_message),
-                            ),
-                        }).to_string());
+                    Some(error) = error_rx.recv() => {
+                        let mode = realtime_error_mode(&error);
+                        let error_message = error.message.clone();
+                        let payload = serde_json::to_value(&error).unwrap_or_else(|_| json!({
+                            "error_type": error.error_type,
+                            "message": error.message,
+                        }));
+                        emit_event_to(&broadcast, events::MAIL_ERROR, &account_id, payload);
+                        emit_realtime_status_to(
+                            &broadcast,
+                            &account_id,
+                            &provider,
+                            mode,
+                            None,
+                            None,
+                            Some(error_message),
+                        );
+                    }
+                    Some(progress) = progress_rx.recv() => {
+                        let payload = serde_json::to_value(&progress).unwrap_or_else(|_| json!({
+                            "account_id": progress.account_id,
+                            "status": progress.status,
+                            "phase": progress.phase,
+                            "message": progress.message,
+                        }));
+                        emit_event_to(
+                            &broadcast,
+                            events::MAIL_SYNC_PROGRESS,
+                            &progress.account_id,
+                            payload,
+                        );
                     }
                     Some(stored) = message_rx.recv() => {
                         if !stored.reconciliation {
-                            let _ = broadcast.send(json!({
-                                "type": events::MAIL_NEW,
-                                "account_id": stored.message.account_id,
-                                "payload": {
-                                    "account_id": stored.message.account_id,
-                                    "message_id": stored.message.id,
-                                    "folder_ids": stored.folder_ids,
-                                    "thread_id": stored.message.thread_id,
-                                    "subject": stored.message.subject,
-                                    "from": stored.message.from_address,
-                                    "received_at": stored.message.date,
-                                },
-                            }).to_string());
+                            let notify = crate::commands::indexing::should_notify_new_mail(&store, &stored)
+                                .unwrap_or_else(|error| {
+                                    warn!(
+                                        message_id = %stored.message.id,
+                                        "Failed to evaluate new-mail notification eligibility: {error}"
+                                    );
+                                    false
+                                });
+                            let account_id = stored.message.account_id.clone();
+                            let message_id = stored.message.id.clone();
+                            emit_event_to(
+                                &broadcast,
+                                events::MAIL_NEW,
+                                &account_id,
+                                crate::commands::indexing::new_mail_event_payload(&stored),
+                            );
+                            if notify {
+                                let notification_body =
+                                    crate::commands::indexing::new_mail_notification_body(&stored);
+                                crate::browser_notifications::emit_browser_notification(
+                                    &broadcast,
+                                    "Pebble - New Mail",
+                                    &notification_body,
+                                    Some(&account_id),
+                                    Some(&message_id),
+                                );
+                            }
                         }
                         crate::commands::indexing::index_stored_message(&search, &store, &stored).await;
-                    }
-                    Some(progress) = progress_rx.recv() => {
-                        let _ = broadcast.send(json!({
-                            "type": events::MAIL_SYNC_PROGRESS,
-                            "account_id": progress.account_id,
-                            "payload": {
-                                "status": progress.status,
-                                "phase": progress.phase,
-                                "message": progress.message,
-                            },
-                        }).to_string());
                     }
                     else => break,
                 }
             }
         });
-        let mut sync_config = SyncConfig::default();
-        sync_config.poll_interval_secs = 0;
-        sync_config.reconcile_interval_secs = 86400;
-        let worker = Pop3SyncWorker::new(
-            account.id.clone(),
-            provider,
-            self.store.clone(),
-            stop_rx,
-            self.attachments_dir.clone(),
-        )
-        .with_error_tx(error_tx)
-        .with_message_tx(message_tx)
-        .with_progress_tx(progress_tx);
-        worker.run(sync_config, None).await;
-        self.emit(
-            events::MAIL_SYNC_COMPLETE,
-            &account.id,
-            json!({"status": "completed", "phase": "pop3"}),
-        );
-        Ok(())
-    }
 
-    fn emit(&self, event_type: &str, account_id: &str, detail: Value) {
-        // 事件名直接作为 type（与桌面端 Tauri event 名一致），不再拼前缀
-        let _ = self.ws_broadcast.send(
-            json!({
-                "type": event_type,
-                "account_id": account_id,
-                "payload": detail,
-            })
-            .to_string(),
-        );
+        (error_tx, progress_tx, message_tx)
     }
 
     fn emit_realtime_status(
@@ -606,19 +693,65 @@ impl SyncManager {
         next_retry_at: Option<i64>,
         message: Option<String>,
     ) {
-        self.emit(
-            events::MAIL_REALTIME_STATUS,
+        emit_realtime_status_to(
+            &self.ws_broadcast,
             &account.id,
-            realtime_status_payload(
-                &account.id,
-                provider_slug(&account.provider),
-                mode,
-                last_success_at,
-                next_retry_at,
-                message,
-            ),
+            &account.provider,
+            mode,
+            last_success_at,
+            next_retry_at,
+            message,
         );
     }
+}
+
+fn emit_event_to(
+    broadcast: &broadcast::Sender<String>,
+    event_type: &str,
+    account_id: &str,
+    payload: Value,
+) {
+    let _ = broadcast.send(
+        json!({
+            "type": event_type,
+            "account_id": account_id,
+            "payload": payload,
+        })
+        .to_string(),
+    );
+}
+
+fn emit_sync_complete_to(broadcast: &broadcast::Sender<String>, account_id: &str) {
+    emit_event_to(
+        broadcast,
+        events::MAIL_SYNC_COMPLETE,
+        account_id,
+        json!({ "account_id": account_id }),
+    );
+}
+
+fn emit_realtime_status_to(
+    broadcast: &broadcast::Sender<String>,
+    account_id: &str,
+    provider: &ProviderType,
+    mode: &str,
+    last_success_at: Option<i64>,
+    next_retry_at: Option<i64>,
+    message: Option<String>,
+) {
+    emit_event_to(
+        broadcast,
+        events::MAIL_REALTIME_STATUS,
+        account_id,
+        json!({
+            "account_id": account_id,
+            "mode": mode,
+            "provider": provider_slug(provider),
+            "last_success_at": last_success_at,
+            "next_retry_at": next_retry_at,
+            "message": message,
+        }),
+    );
 }
 
 fn provider_slug(provider: &ProviderType) -> &'static str {
@@ -630,38 +763,19 @@ fn provider_slug(provider: &ProviderType) -> &'static str {
     }
 }
 
-fn realtime_mode_for_interval(seconds: u64) -> &'static str {
-    if seconds == 0 {
-        "manual"
-    } else {
-        "polling"
-    }
+fn now_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
-fn realtime_status_message(seconds: u64) -> String {
-    if seconds == 0 {
+fn polling_status_message(config: &SyncConfig) -> String {
+    if config.manual_only() {
         "Manual only".to_string()
     } else {
-        format!("Polling every {seconds}s")
+        format!("Polling every {}s", config.poll_interval_secs)
     }
-}
-
-fn realtime_status_payload(
-    account_id: &str,
-    provider: &str,
-    mode: &str,
-    last_success_at: Option<i64>,
-    next_retry_at: Option<i64>,
-    message: Option<String>,
-) -> Value {
-    json!({
-        "account_id": account_id,
-        "mode": mode,
-        "provider": provider,
-        "last_success_at": last_success_at,
-        "next_retry_at": next_retry_at,
-        "message": message,
-    })
 }
 
 fn realtime_error_mode(error: &pebble_mail::SyncError) -> &'static str {
@@ -682,15 +796,5 @@ fn realtime_error_mode(error: &pebble_mail::SyncError) -> &'static str {
         "backoff"
     } else {
         "error"
-    }
-}
-
-fn sync_sleep_duration(seconds: u64) -> Duration {
-    if seconds == 0 {
-        // Manual mode has no automatic wake-up; the watch channel interrupts
-        // this sleep immediately when a new preference is selected.
-        Duration::from_secs(24 * 60 * 60)
-    } else {
-        Duration::from_secs(seconds)
     }
 }

@@ -8,8 +8,16 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PebbleError> + Send + 'static,
 {
+    run_blocking_core(f).await.map_err(ApiError::from_pebble)
+}
+
+/// Run blocking core work without converting its business error into an HTTP error.
+pub(crate) async fn run_blocking_core<T, F>(f: F) -> Result<T, PebbleError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PebbleError> + Send + 'static,
+{
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| ApiError::Internal(format!("task join error: {e}")))?
-        .map_err(ApiError::from_pebble)
+        .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?
 }

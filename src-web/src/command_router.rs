@@ -223,8 +223,9 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
             attachments::cleanup_staged_compose_attachment(state, args).await?,
         )),
         "get_attachment_path" => Ok(Json(attachments::get_attachment_path(state, args).await?)),
-        "save_draft" => Ok(Json(drafts::save_draft(state, args).await?)),
-        "delete_draft" => Ok(Json(drafts::delete_draft(state, args).await?)),
+        "save_draft" | "delete_draft" => Ok(Json(
+            drafts::dispatch_command(state, command, args).await?,
+        )),
         "list_email_templates" => Ok(Json(user_data::list_email_templates(state, args).await?)),
         "save_email_template" => Ok(Json(user_data::save_email_template(state, args).await?)),
         "delete_email_template" => Ok(Json(user_data::delete_email_template(state, args).await?)),
@@ -352,7 +353,7 @@ pub async fn health(State(_state): State<AppStateRef>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "service": "pebble-web",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("PEBBLE_APP_VERSION"),
     }))
 }
 

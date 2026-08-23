@@ -6,20 +6,16 @@ function camelToSnake(key: string): string {
   return key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 }
 
-function deepSnakeKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(deepSnakeKeys);
-  if (typeof value === "object" && value !== null) {
-    const out: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value)) {
-      out[camelToSnake(key)] = deepSnakeKeys(child);
-    }
-    return out;
-  }
-  return value;
-}
-
-/** Mirror Tauri's camelCase JavaScript argument to snake_case Rust boundary. */
+/**
+ * Mirror Tauri's command boundary: only top-level JavaScript argument names
+ * are mapped from camelCase to Rust snake_case. Nested DTOs are left intact
+ * and are decoded by their own Serde rules.
+ */
 export function normalizeBackendArgs(_command: string, args?: InvokeArgs): unknown {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args ?? {};
-  return deepSnakeKeys(args);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    out[camelToSnake(key)] = value;
+  }
+  return out;
 }

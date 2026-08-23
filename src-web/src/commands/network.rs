@@ -98,6 +98,49 @@ pub(crate) fn resolve_effective_proxy_setting(
     }
 }
 
+pub(crate) fn normalize_account_proxy_setting(
+    mode: AccountProxyMode,
+    proxy: Option<HttpProxyConfig>,
+) -> AccountProxySetting {
+    let mode = if matches!(mode, AccountProxyMode::Inherit) && proxy.is_some() {
+        AccountProxyMode::Custom
+    } else {
+        mode
+    };
+    let proxy = if matches!(mode, AccountProxyMode::Custom) {
+        proxy
+    } else {
+        None
+    };
+
+    AccountProxySetting { mode, proxy }
+}
+
+pub(crate) fn account_proxy_setting_from_parts(
+    mode: AccountProxyMode,
+    proxy_host: Option<String>,
+    proxy_port: Option<u16>,
+    label: &str,
+) -> Result<AccountProxySetting, PebbleError> {
+    let proxy = proxy_config_from_parts(proxy_host, proxy_port, label)?;
+    match mode {
+        AccountProxyMode::Custom => {
+            let proxy = proxy.ok_or_else(|| {
+                PebbleError::Network(format!(
+                    "{label} host and port are required when custom proxy is selected"
+                ))
+            })?;
+            Ok(AccountProxySetting {
+                mode,
+                proxy: Some(proxy),
+            })
+        }
+        AccountProxyMode::Inherit | AccountProxyMode::Disabled => {
+            Ok(AccountProxySetting { mode, proxy: None })
+        }
+    }
+}
+
 pub(crate) fn mail_proxy_from_http(proxy: HttpProxyConfig) -> ProxyConfig {
     ProxyConfig {
         host: proxy.host,

@@ -1,9 +1,19 @@
-use pebble_core::{ContactInput, KnownContact, VcardImportResult};
+use pebble_core::{ContactInput, KnownContact, PebbleError, VcardImportResult};
 use serde_json::Value;
 
 use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
+
+fn validated_contact_id(contact_id: &str) -> Result<&str, PebbleError> {
+    let contact_id = contact_id.trim();
+    if contact_id.is_empty() {
+        return Err(PebbleError::Validation(
+            "Contact id must not be empty".to_string(),
+        ));
+    }
+    Ok(contact_id)
+}
 
 pub async fn list_contacts(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
@@ -33,10 +43,14 @@ pub async fn list_contacts(state: AppStateRef, args: Value) -> Result<Value, Api
 }
 
 pub async fn get_contact_by_email(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let address: String = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        address: String,
+    }
+    let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid get_contact_by_email args: {e}")))?;
     let store = state.store.clone();
-    let contact = run_blocking(move || store.get_contact_by_email(&address)).await?;
+    let contact = run_blocking(move || store.get_contact_by_email(&args.address)).await?;
     serde_json::to_value(contact).map_err(ApiError::from_serialize)
 }
 
@@ -59,15 +73,12 @@ pub async fn delete_contact(state: AppStateRef, args: Value) -> Result<Value, Ap
     }
     let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid delete_contact args: {e}")))?;
-    let contact_id = args.contact_id.trim().to_string();
-    if contact_id.is_empty() {
-        return Err(ApiError::BadRequest(
-            "contact id must not be empty".to_string(),
-        ));
-    }
     let store = state.store.clone();
     run_blocking(move || {
-        store.delete_contact(&contact_id, args.suppress_addresses.unwrap_or(false))
+        store.delete_contact(
+            validated_contact_id(&args.contact_id)?,
+            args.suppress_addresses.unwrap_or(false),
+        )
     })
     .await?;
     Ok(Value::Null)
@@ -81,14 +92,11 @@ pub async fn set_contact_favorite(state: AppStateRef, args: Value) -> Result<Val
     }
     let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid set_contact_favorite args: {e}")))?;
-    let contact_id = args.contact_id.trim().to_string();
-    if contact_id.is_empty() {
-        return Err(ApiError::BadRequest(
-            "contact id must not be empty".to_string(),
-        ));
-    }
     let store = state.store.clone();
-    run_blocking(move || store.set_contact_favorite(&contact_id, args.is_favorite)).await?;
+    run_blocking(move || {
+        store.set_contact_favorite(validated_contact_id(&args.contact_id)?, args.is_favorite)
+    })
+    .await?;
     Ok(Value::Null)
 }
 
@@ -118,20 +126,28 @@ pub async fn suppress_contact_suggestion(
     state: AppStateRef,
     args: Value,
 ) -> Result<Value, ApiError> {
-    let address: String = serde_json::from_value(args).map_err(|e| {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        address: String,
+    }
+    let args: Args = serde_json::from_value(args).map_err(|e| {
         ApiError::BadRequest(format!("invalid suppress_contact_suggestion args: {e}"))
     })?;
     let store = state.store.clone();
-    run_blocking(move || store.suppress_contact_suggestion(&address)).await?;
+    run_blocking(move || store.suppress_contact_suggestion(&args.address)).await?;
     Ok(Value::Null)
 }
 
 pub async fn import_contacts_vcard(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let data: String = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        data: String,
+    }
+    let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid import_contacts_vcard args: {e}")))?;
     let store = state.store.clone();
     let result: VcardImportResult =
-        run_blocking(move || store.import_contacts_vcard(&data)).await?;
+        run_blocking(move || store.import_contacts_vcard(&args.data)).await?;
     serde_json::to_value(result).map_err(ApiError::from_serialize)
 }
 

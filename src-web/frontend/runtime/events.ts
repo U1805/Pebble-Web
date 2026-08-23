@@ -7,13 +7,14 @@
  *   仅 import 来源指向本平台层（计划书 §44 优先兼容上游事件）。
  * - Web 构建通过 Vite alias 将 `@tauri-apps/api/event` 指向本文件。
  * - 事件 transport 走 WebSocket（单例连接 /api/v1/ws，首消息裸 token 鉴权，
- *   服务器广播 {type, account_id, payload} 桥接为 Tauri 同构事件；
+ *   服务器广播中的 `payload` 原样桥接为 Tauri 同构事件；
+ *   envelope 的 Web transport 元数据不并入 payload。
  *   options.target 在 Web 端无对应语义，忽略）。
  *
  * 事件名与桌面端 Tauri event 名完全一致（统一事件名称表）。
  */
 export type UnlistenFn = () => void;
-import { getWebToken } from "./session";
+import { expireWebSession, getWebToken } from "./session";
 import {
   WEB_ATTACHMENT_DOWNLOAD_PROGRESS_EVENT,
   WEB_NOTIFICATION_OPEN_EVENT,
@@ -57,9 +58,8 @@ export interface EventOptions {
 }
 
 /**
- * 把后端 WS 广播消息 {type, account_id, payload} 桥接为 Tauri 同构事件。
- * 顶层 account_id 并入 payload（桌面端事件 payload 内嵌 account_id，对齐结构）。
- * 纯函数，便于单测。
+ * 把后端 WS 广播消息桥接为 Tauri 同构事件。
+ * `payload` 必须原样保留。WebSocket envelope 的 `account_id` 只是 transport 元数据。
  */
 export function buildEventFromWsMessage(msg: {
   type?: string;
@@ -68,17 +68,7 @@ export function buildEventFromWsMessage(msg: {
 }): TauriEvent<unknown> | null {
   if (!msg.type) return null;
 
-  let payload = msg.payload ?? {};
-  if (
-    msg.account_id != null &&
-    (typeof payload !== "object" || payload === null || !("account_id" in payload))
-  ) {
-    const base: Record<string, unknown> =
-      typeof payload === "object" && payload !== null ? { ...(payload as object) } : {};
-    base.account_id = msg.account_id;
-    payload = base;
-  }
-
+  const payload: unknown = msg.payload === undefined ? null : msg.payload;
   return { event: msg.type, id: 0, payload };
 }
 
@@ -87,7 +77,6 @@ export function buildEventFromWsMessage(msg: {
 // ---------------------------------------------------------------------------
 
 let ws: WebSocket | null = null;
-let wsAuthenticated = false;
 let wsSeq = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 const wsHandlers = new Map<string, Set<(event: TauriEvent<unknown>) => void>>();
@@ -110,14 +99,16 @@ function connectWebSocket(): void {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${window.location.host}/api/v1/ws`;
 
-  ws = new WebSocket(url);
-  wsAuthenticated = false;
+  const socket = new WebSocket(url);
+  ws = socket;
+  let authenticated = false;
+  let authRejected = false;
 
-  ws.onopen = () => {
-    ws?.send(getWebToken() ?? "");
+  socket.onopen = () => {
+    socket.send(getWebToken() ?? "");
   };
 
-  ws.onmessage = (raw) => {
+  socket.onmessage = (raw) => {
     let msg: { type?: string; account_id?: string; payload?: unknown };
     try {
       msg = JSON.parse(String(raw.data));
@@ -125,12 +116,14 @@ function connectWebSocket(): void {
       return; // 非 JSON 帧忽略（含二进制/心跳）
     }
 
-    if (!wsAuthenticated) {
+    if (!authenticated) {
       if (msg.type === "authenticated") {
-        wsAuthenticated = true;
+        authenticated = true;
       } else if (msg.type === "error") {
-        // 鉴权失败：由服务器关闭，不重连
-        ws?.close();
+        // 认证失败是会话错误，不属于可重试的 WebSocket 传输故障。
+        authRejected = true;
+        expireWebSession();
+        socket.close(4001, "unauthorized");
       }
       return;
     }
@@ -141,18 +134,23 @@ function connectWebSocket(): void {
     handlers?.forEach((cb) => cb(event));
   };
 
-  ws.onclose = (closeEvent) => {
-    const wasAuthenticated = wsAuthenticated;
-    ws = null;
-    wsAuthenticated = false;
-    // 鉴权失败（4001）或从未认证成功 → 不重连；其余按指数退避重连
-    if (wasAuthenticated && closeEvent.code !== 4001 && shouldConnect()) {
+  socket.onclose = (closeEvent) => {
+    const isCurrentSocket = ws === socket;
+    if (isCurrentSocket) {
+      ws = null;
+    }
+    if (authRejected || closeEvent.code === 4001) {
+      expireWebSession();
+      return;
+    }
+    // Ignore a stale socket's close after a newer connection already replaced it.
+    if (isCurrentSocket && shouldConnect()) {
       scheduleReconnect();
     }
   };
 
-  ws.onerror = () => {
-    ws?.close();
+  socket.onerror = () => {
+    socket.close();
   };
 }
 
@@ -215,8 +213,9 @@ export function listen<T>(
       wsHandlers.delete(event);
     }
     if (wsHandlers.size === 0) {
-      ws?.close();
+      const socket = ws;
       ws = null;
+      socket?.close();
     }
   });
 }

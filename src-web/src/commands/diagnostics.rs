@@ -4,6 +4,9 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+const DEFAULT_LOG_MAX_BYTES: u64 = 64 * 1024;
+const MAX_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
@@ -18,13 +21,16 @@ pub struct AppLogSnapshot {
 /// 读取服务日志尾部（max_bytes 上限，对齐桌面端语义）。
 /// 参数：{ max_bytes }（调用层已由前端 maxBytes 转换）。
 pub async fn read_app_log(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        max_bytes: Option<u64>,
+    }
+    let args: Args = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid read_app_log args: {e}")))?;
     let max_bytes = args
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            ApiError::BadRequest("invalid read_app_log args: expected max_bytes".into())
-        })?
-        .min(1024 * 1024); // 单次读取 1MB 上限，避免超大日志拖垮响应
+        .max_bytes
+        .unwrap_or(DEFAULT_LOG_MAX_BYTES)
+        .clamp(1, MAX_LOG_MAX_BYTES);
 
     let snapshot =
         read_log_tail(&state.config.log_path(), max_bytes).map_err(ApiError::Internal)?;

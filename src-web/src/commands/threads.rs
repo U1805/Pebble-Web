@@ -29,9 +29,13 @@ pub async fn list_threads(state: AppStateRef, args: Value) -> Result<Value, ApiE
 
 /// 列出线程内全部消息（按时间序）。
 pub async fn list_thread_messages(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let thread_id: String = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        thread_id: String,
+    }
+    let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid list_thread_messages args: {e}")))?;
     let store = state.store.clone();
-    let messages = run_blocking(move || store.list_messages_by_thread(&thread_id)).await?;
+    let messages = run_blocking(move || store.list_messages_by_thread(&args.thread_id)).await?;
     serde_json::to_value(messages).map_err(ApiError::from_serialize)
 }

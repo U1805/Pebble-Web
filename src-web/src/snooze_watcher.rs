@@ -20,6 +20,9 @@ pub async fn run_snooze_watcher(
     const VACUUM_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
 
     let mut ticker = tokio::time::interval(INTERVAL);
+    // Tokio intervals fire once immediately. Consume that tick so the first
+    // due-snooze pass matches the desktop watcher after one 30-second delay.
+    ticker.tick().await;
     let mut last_purge = Instant::now();
     let mut last_vacuum = Instant::now();
 
@@ -81,6 +84,15 @@ pub async fn process_due_snoozes(
         let message_id = snoozed.message_id.clone();
         match tokio::task::spawn_blocking(move || item_store.unsnooze_message(&message_id)).await {
             Ok(Ok(())) => {
+                let notification_body = {
+                    let lookup_store = store.clone();
+                    let lookup_id = snoozed.message_id.clone();
+                    match tokio::task::spawn_blocking(move || lookup_store.get_message(&lookup_id)).await {
+                        Ok(Ok(Some(message))) if message.from_name.is_empty() => message.subject,
+                        Ok(Ok(Some(message))) => format!("{}: {}", message.from_name, message.subject),
+                        _ => snoozed.message_id.clone(),
+                    }
+                };
                 let _ = ws_broadcast.send(
                     json!({
                         "type": events::MAIL_UNSNOOZED,
@@ -90,6 +102,13 @@ pub async fn process_due_snoozes(
                         },
                     })
                     .to_string(),
+                );
+                crate::browser_notifications::emit_browser_notification(
+                    &ws_broadcast,
+                    "Pebble - Snoozed Message",
+                    &notification_body,
+                    None,
+                    None,
                 );
             }
             Ok(Err(error)) => warn!("Failed to unsnooze message: {error}"),

@@ -132,7 +132,12 @@ fn set_signature_raw(
         decrypt_json(store, crypto, EMAIL_SIGNATURES_KEY)?.unwrap_or_default();
     // Preserve an explicit empty value as a tombstone so a delayed legacy
     // migration cannot restore a signature the user deliberately cleared.
-    signatures.insert(account_id, signature);
+    let stored_signature = if signature.trim().is_empty() {
+        String::new()
+    } else {
+        signature
+    };
+    signatures.insert(account_id, stored_signature);
     encrypt_json(store, crypto, EMAIL_SIGNATURES_KEY, &signatures)
 }
 
@@ -191,7 +196,6 @@ pub async fn delete_email_template(state: AppStateRef, args: Value) -> Result<Va
 
 pub async fn get_email_signature(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Args {
         account_id: String,
     }
@@ -213,7 +217,6 @@ pub async fn get_email_signature(state: AppStateRef, args: Value) -> Result<Valu
 
 pub async fn set_email_signature(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Args {
         account_id: String,
         signature: String,
@@ -233,7 +236,6 @@ pub async fn migrate_email_signature_if_absent(
     args: Value,
 ) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Args {
         account_id: String,
         signature: String,

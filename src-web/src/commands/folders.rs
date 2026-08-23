@@ -1,6 +1,5 @@
-use pebble_core::traits::FolderProvider;
 use pebble_core::{new_id, Folder, FolderRole, FolderType, ProviderType};
-use pebble_mail::{should_hide_outlook_folder, ImapMailProvider};
+use pebble_mail::should_hide_outlook_folder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -96,7 +95,11 @@ async fn discover_imap_folders(
         .store
         .get_account(account_id)
         .map_err(ApiError::from_store)?
-        .ok_or_else(|| ApiError::NotFound(format!("account not found: {account_id}")))?;
+        .ok_or_else(|| {
+            ApiError::from_pebble(pebble_core::PebbleError::Internal(format!(
+                "Account not found: {account_id}"
+            )))
+        })?;
     if account.provider != ProviderType::Imap {
         return Err(ApiError::from_pebble(
             pebble_core::PebbleError::UnsupportedProvider(
@@ -104,17 +107,14 @@ async fn discover_imap_folders(
             ),
         ));
     }
-    let config = crate::commands::messages::load_imap_config(&state.store, &state.crypto, account_id)?;
-    let mut provider = ImapMailProvider::new(config);
-    provider.set_account_id(account_id.to_string());
-    provider.connect().await?;
-    let result = provider.list_folders().await;
+    let provider = crate::commands::messages::connect_imap(state, account_id).await?;
+    let result = provider.list_folders(account_id).await;
     if let Err(error) = provider.disconnect().await {
         tracing::debug!(
-            "failed to disconnect IMAP folder discovery session for {account_id}: {error}"
+            "Failed to disconnect IMAP folder discovery session for account {account_id}: {error}"
         );
     }
-    Ok(result?)
+    result.map_err(ApiError::from_pebble)
 }
 
 fn selected_remote_ids_for_settings(
@@ -215,20 +215,24 @@ pub async fn update_imap_sync_folders(state: AppStateRef, args: Value) -> Result
         tracing::warn!("failed to refresh search documents after changing IMAP folders: {error}");
     }
     let attachments_dir = state.attachments_dir.clone();
+    let deleted_message_ids = change.deleted_message_ids;
     if let Err(error) = tokio::task::spawn_blocking(move || {
-        for message_id in change.deleted_message_ids {
+        for message_id in deleted_message_ids {
             let message_dir = attachments_dir.join(&message_id);
             if message_dir.exists() {
-                std::fs::remove_dir_all(&message_dir)
-                    .map_err(|e| pebble_core::PebbleError::Internal(e.to_string()))?;
+                if let Err(error) = std::fs::remove_dir_all(&message_dir) {
+                    tracing::warn!(
+                        "Failed to remove attachments for deselected-folder message {message_id}: {error}"
+                    );
+                }
             }
         }
-        Ok::<(), pebble_core::PebbleError>(())
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("attachment cleanup task failed: {e}")))?
     {
-        tracing::warn!("failed to clean attachments after changing IMAP folders: {error}");
+        tracing::warn!(
+            "Attachment cleanup task failed after changing IMAP folders: {error}"
+        );
     }
     serde_json::to_value(ImapSyncFolderSettings {
         folders,

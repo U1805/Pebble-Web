@@ -51,9 +51,13 @@ pub async fn update_rule(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 }
 
 pub async fn delete_rule(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
-    let rule_id: String = serde_json::from_value(args)
+    #[derive(serde::Deserialize)]
+    struct Args {
+        rule_id: String,
+    }
+    let args: Args = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid delete_rule args: {e}")))?;
     let store = state.store.clone();
-    run_blocking(move || store.delete_rule(&rule_id)).await?;
+    run_blocking(move || store.delete_rule(&args.rule_id)).await?;
     Ok(Value::Null)
 }
