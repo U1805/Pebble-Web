@@ -13,6 +13,8 @@ pub mod crypto;
 pub mod error;
 pub mod events;
 pub(crate) mod oauth;
+#[path = "../patch/mod.rs"]
+pub(crate) mod patch;
 pub mod profile;
 pub mod state;
 pub mod snooze_watcher;

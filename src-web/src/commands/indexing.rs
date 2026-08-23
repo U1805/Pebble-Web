@@ -170,9 +170,11 @@ fn apply_web_rule_action(
                 info!("Rule: queued remote archive for message {}", message.id);
                 return Ok(());
             }
-            if let Some(archive_folder) =
-                store.find_folder_by_role(&message.account_id, FolderRole::Archive)?
-            {
+            if let Some(archive_folder) = crate::patch::folders::find_preferred_folder_by_role(
+                store,
+                &message.account_id,
+                FolderRole::Archive,
+            )? {
                 store.move_message_to_folder(&message.id, &archive_folder.id)?;
                 info!(
                     "Rule: archived message {} to folder {}",
@@ -292,7 +294,11 @@ fn queue_remote_rule_action(
             Ok(true)
         }
         RuleAction::Archive => {
-            let archive_folder = store.find_folder_by_role(account_id, FolderRole::Archive)?;
+            let archive_folder = crate::patch::folders::find_preferred_folder_by_role(
+                store,
+                account_id,
+                FolderRole::Archive,
+            )?;
             if let Some(archive) = archive_folder.as_ref() {
                 if archive.remote_id.starts_with("__local_") {
                     return Ok(false);

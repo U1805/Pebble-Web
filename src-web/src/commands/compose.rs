@@ -41,7 +41,11 @@ pub(crate) fn ensure_local_outgoing_folder(
     state: LocalOutgoingState,
 ) -> Result<Folder, PebbleError> {
     if state == LocalOutgoingState::Sent {
-        if let Some(folder) = store.find_folder_by_role(account_id, FolderRole::Sent)? {
+        if let Some(folder) = crate::patch::folders::find_preferred_folder_by_role(
+            store,
+            account_id,
+            FolderRole::Sent,
+        )? {
             return Ok(folder);
         }
     }
@@ -139,7 +143,7 @@ fn prepare_outgoing_send_locally(
         validate_staged_attachment_paths(&state.attachments_dir, attachment_paths)?;
     let attachment_records =
         stage_local_attachment_records(&state.attachments_dir, &id, &attachment_paths)?;
-    let message = Message {
+    let mut message = Message {
         id: id.clone(),
         account_id: account.id.clone(),
         remote_id: format!("local-outbox-{id}"),
@@ -167,6 +171,7 @@ fn prepare_outgoing_send_locally(
         created_at: now,
         updated_at: now,
     };
+    crate::patch::outgoing::assign_thread_id(&state.store, &mut message)?;
 
     let payload = serde_json::json!({
         "provider_account_id": message.account_id,

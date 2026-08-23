@@ -10,6 +10,29 @@
 - P2 的 Web 专属能力不属于当前对齐范围。
 - 多用户、管理页、PWA、Web Push 和 Web 专属安全审计暂不在本文记录为缺失。
 
+## 上游兼容补丁
+
+- `src-tauri` 和共享 crates 保持与 QingJ01/Pebble 上游同步。
+- `src-web/patch/` 统一隔离测试中确认、但尚未由上游修复的问题
+- `src-web/src` 只保留调用这些补丁的最小接入点，避免以后同步上游时把 Web 修复误认为业务语义分叉。
+- 若补丁与上游公开 issue 的行为和根因明确对应，文件名使用 `issueNNN_` 前缀（issue ID 不足三位时前置补 `0`，例如 `issue026_`）；仅症状相似但根因不同的补丁不关联 issue 编号。
+
+当前补丁如下。
+
+| 补丁 | 上游行为 | Web 修复 |
+|---|---|---|
+| `drafts.rs` | 账户没有 Drafts 文件夹时，本地草稿不关联任何文件夹，页面刷新后无法再访问 | 创建并复用 `__local_drafts__`，保证本地草稿始终具有可见的 Drafts 归属 |
+| `outgoing.rs` | 本地 Outbox/Sent 邮件以空 `thread_id` 写入，导致已发送目录在会话视图中为空，回复也不能加入原会话 | 写入外发占位记录前按共享线程规则计算 `thread_id` |
+| `archive.rs` | IMAP 没有远端 Archive 时仍移动到 `__local_archive__`，服务器 INBOX 原件随后会被同步为第二条活动记录 | 拒绝没有服务器 Archive 目标的 IMAP 单封和批量归档，避免静默制造重复邮件 |
+| `batch_delete.rs` | 批量删除在远端移入 Trash 后仍统一软删除本地记录，pending 重放也会把已经位于 Trash 的普通删除误作本地软删除；离线永久删除还可能提前清除本地记录 | 操作前保存源目录语义，普通删除及重放均幂等移动到 Trash 并保持可见，只有原本位于 Trash 且远端确认成功的邮件才硬删除 |
+| `folders.rs` | 本地占位系统目录不会在同角色远端目录出现后移除，无序角色查询可能继续命中 `__local_*`，导致远端写回被错误降级或拒绝 | Web 解析系统目录时优先 provider-backed 目录，仅在没有远端目录时使用本地回退 |
+| `issue026_imap_move.rs` | [issue #26](https://github.com/QingJ01/Pebble/issues/26) 暴露了 MOVE 后远端身份改变、本地仍保留旧 `remote_id` 的问题；上游修复覆盖 Outlook，但 IMAP MOVE 后仍继续保留源邮箱 UID，目标邮箱分配新 UID 后，下次同步会把同一邮件导入为第二条活动记录 | 将同一远端身份更新原则扩展到 IMAP：移动前后核对目标邮箱，按 `Message-ID` 或唯一新增 UID 更新本地 `remote_id`；若并发同步已写入权威目标记录并造成身份冲突，则隐藏失效源记录 |
+| `issue051_cloud_sync_locales.ts` | 上游为 [issue #51](https://github.com/QingJ01/Pebble/issues/51) 增加自动 WebDAV 备份后，界面使用了未写入中英文 locale 的文案键，中文界面显示英文 fallback | 在 Web i18n 入口合并缺失的自动备份配置、校验和结果文案 |
+| `sidebar_empty_accounts.ts` | 多账户场景中，两个账户都尚无文件夹时 Sidebar 会在账户间反复自动切换，最终触发 React 最大更新深度错误 | Web 构建时把空文件夹回退收敛到稳定的“全部邮箱”，并在上游代码变化时要求重新审查补丁 |
+| `gmail_oauth.rs` | Gmail OAuth 授权请求未声明离线访问，Google 可以只返回短期 access token 而不返回 refresh token，令牌过期后账户无法继续同步 | Gmail 授权请求增加 `access_type=offline` 和 `prompt=consent`，确保首次授权和重新授权都取得 refresh token |
+
+SMTP 回复邮件缺少 `Message-ID` / `References`、回复后未设置 IMAP `\Answered`，以及 IMAP IDLE 偶发漏掉首次事件，当前都位于共享邮件实现中。为避免复制 SMTP/IMAP transport，本轮不在 Web 层覆盖；待上游修复后直接随共享 crates 同步。
+
 ## 桌面专属功能
 
 以下功能依赖桌面操作系统或 Tauri 宿主。
@@ -175,6 +198,10 @@ Web 的 `add_account` 只接受 IMAP 和 POP3，因为该命令写入 IMAP/SMTP 
 Web 不允许该命令创建 Gmail 或 Outlook 账户，避免生成 provider 与 auth data 格式不匹配的账户。
 
 OAuth token、proxy 更新和 refresh 使用相同的账户级锁，避免并发覆盖凭据。
+
+debug/test 构建可设置 `PEBBLE_OAUTH_TEST_BASE_URL`，把 Gmail 和 Outlook 的
+`authorize`、`token`、`userinfo` 请求指向独立可控测试服务。release 构建忽略该变量，
+继续固定使用 Google 与 Microsoft 官方端点。
 
 实现位置：
 

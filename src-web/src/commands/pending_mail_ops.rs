@@ -415,16 +415,16 @@ async fn replay_remote_archive(
             let source_remote_id = source_folder_remote_id(state, message, payload)?;
             let target_remote_id =
                 target_folder_remote_id(state, message, payload, FolderRole::Archive)?;
-            let uid = parse_uid(message)?;
+            let _uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = crate::patch::imap_move::move_message_and_update_uid(
+                &imap,
+                &state.store,
+                message,
+                &source_remote_id,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
@@ -473,16 +473,16 @@ async fn replay_remote_restore(
             let source_remote_id = source_folder_remote_id(state, message, payload)?;
             let target_remote_id =
                 target_folder_remote_id(state, message, payload, FolderRole::Inbox)?;
-            let uid = parse_uid(message)?;
+            let _uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = crate::patch::imap_move::move_message_and_update_uid(
+                &imap,
+                &state.store,
+                message,
+                &source_remote_id,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
@@ -540,11 +540,12 @@ async fn replay_remote_delete(
                 if trash_remote_id == source_remote_id {
                     imap.delete_message(&source_remote_id, uid).await
                 } else {
-                    imap.move_message_with_dedup(
+                    crate::patch::imap_move::move_message_and_update_uid(
+                        &imap,
+                        &state.store,
+                        message,
                         &source_remote_id,
-                        uid,
                         &trash_remote_id,
-                        message.message_id_header.as_deref(),
                     )
                     .await
                 }
@@ -592,16 +593,16 @@ async fn replay_remote_move_to_folder(
             let source_remote_id = source_folder_remote_id(state, message, payload)?;
             let target_remote_id =
                 target_folder_remote_id(state, message, payload, FolderRole::Inbox)?;
-            let uid = parse_uid(message)?;
+            let _uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
+            let result = crate::patch::imap_move::move_message_and_update_uid(
+                &imap,
+                &state.store,
+                message,
+                &source_remote_id,
+                &target_remote_id,
+            )
+            .await;
             let _ = imap.disconnect().await;
             result
         }
@@ -661,11 +662,14 @@ fn apply_pending_local_commit(
             if let Some(folder_id) = string_field(&payload, "target_folder_id")
                 .or_else(|| string_field(&payload, "archive_folder_id"))
                 .or_else(|| {
-                    store
-                        .find_folder_by_role(&op.account_id, FolderRole::Archive)
-                        .ok()
-                        .flatten()
-                        .map(|folder| folder.id)
+                    crate::patch::folders::find_preferred_folder_by_role(
+                        store,
+                        &op.account_id,
+                        FolderRole::Archive,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|folder| folder.id)
                 })
             {
                 store.move_message_to_folder(&op.message_id, &folder_id)?;
@@ -686,23 +690,12 @@ fn apply_pending_local_commit(
             store.move_message_to_folder(&op.message_id, &folder_id)?;
         }
         "delete" => {
-            if let Some(trash_folder_id) = string_field(&payload, "trash_folder_id") {
-                let current = store
-                    .get_message_folder_ids(&op.message_id)?
-                    .into_iter()
-                    .next();
-                if current.as_deref() != Some(trash_folder_id.as_str()) {
-                    store.move_message_to_folder(&op.message_id, &trash_folder_id)?;
-                } else {
-                    store.soft_delete_message(&op.message_id)?;
-                }
-            } else if let Some(trash) =
-                store.find_folder_by_role(&op.account_id, FolderRole::Trash)?
-            {
-                store.move_message_to_folder(&op.message_id, &trash.id)?;
-            } else {
-                store.soft_delete_message(&op.message_id)?;
-            }
+            crate::patch::batch_delete::finalize_pending_trash(
+                store,
+                &op.account_id,
+                &op.message_id,
+                string_field(&payload, "trash_folder_id"),
+            )?;
         }
         "delete_permanent" => {
             store.hard_delete_messages(std::slice::from_ref(&op.message_id))?;

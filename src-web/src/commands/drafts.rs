@@ -1,6 +1,6 @@
 use crate::state::{AppState, AppStateRef};
 use pebble_core::{
-    traits::DraftProvider, DraftMessage, EmailAddress, FolderRole, PebbleError, ProviderType,
+    traits::DraftProvider, DraftMessage, EmailAddress, PebbleError, ProviderType,
 };
 use tracing::warn;
 
@@ -270,6 +270,8 @@ fn save_draft_locally(
         .into_iter()
         .filter_map(|attachment| attachment.local_path)
         .collect();
+    let drafts_folder =
+        crate::patch::drafts::ensure_local_drafts_folder(&state.store, account_id)?;
     let attachment_records =
         stage_local_attachment_records(&state.attachments_dir, &id, &draft.attachment_paths)?;
 
@@ -301,17 +303,7 @@ fn save_draft_locally(
         created_at: pebble_core::now_timestamp(),
         updated_at: pebble_core::now_timestamp(),
     };
-    // Attach the draft to the account's Drafts folder if one exists, so it
-    // shows up in the Drafts view. Falls back to no-folder for accounts
-    // without a Drafts folder (e.g. brand-new IMAP account that hasn't yet
-    // synced folder structure).
-    let folder_ids: Vec<String> = match state
-        .store
-        .find_folder_by_role(account_id, FolderRole::Drafts)
-    {
-        Ok(Some(f)) => vec![f.id],
-        _ => Vec::new(),
-    };
+    let folder_ids = vec![drafts_folder.id];
     if let Err(error) =
         state
             .store

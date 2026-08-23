@@ -187,14 +187,19 @@ pub async fn archive_message(
                     }
                 },
                 ProviderType::Imap => {
-                    let uid: u32 = msg.remote_id.parse().map_err(|e| {
+                    let _uid: u32 = msg.remote_id.parse().map_err(|e| {
                         PebbleError::Internal(format!("Invalid remote_id (not a UID): {e}"))
                     })?;
                     match connect_imap(&state, &msg.account_id).await {
                         Ok(imap) => {
-                            let result = imap
-                                .move_message(&source_folder.remote_id, uid, &inbox.remote_id)
-                                .await;
+                            let result = crate::patch::imap_move::move_message_and_update_uid(
+                                &imap,
+                                &state.store,
+                                &msg,
+                                &source_folder.remote_id,
+                                &inbox.remote_id,
+                            )
+                            .await;
                             let _ = imap.disconnect().await;
                             match result {
                                 Ok(()) => RemoteMutationOutcome::Applied,
@@ -257,6 +262,10 @@ pub async fn archive_message(
     // Try to find Archive folder; if not available, just soft-delete locally
     match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive) {
         Ok(archive_folder) => {
+            crate::patch::archive::reject_unsafe_imap_local_archive(
+                &provider_type,
+                &archive_folder,
+            )?;
             let is_local = archive_folder.remote_id.starts_with("__local_");
             let outcome = if is_local {
                 RemoteMutationOutcome::LocalOnly
@@ -358,18 +367,19 @@ pub async fn archive_message(
                         }
                     },
                     ProviderType::Imap => {
-                        let uid: u32 = msg.remote_id.parse().map_err(|e| {
+                        let _uid: u32 = msg.remote_id.parse().map_err(|e| {
                             PebbleError::Internal(format!("Invalid remote_id (not a UID): {e}"))
                         })?;
                         match connect_imap(&state, &msg.account_id).await {
                             Ok(imap) => {
-                                let result = imap
-                                    .move_message(
-                                        &source_folder.remote_id,
-                                        uid,
-                                        &archive_folder.remote_id,
-                                    )
-                                    .await;
+                                let result = crate::patch::imap_move::move_message_and_update_uid(
+                                    &imap,
+                                    &state.store,
+                                    &msg,
+                                    &source_folder.remote_id,
+                                    &archive_folder.remote_id,
+                                )
+                                .await;
                                 let _ = imap.disconnect().await;
                                 match result {
                                     Ok(()) => RemoteMutationOutcome::Applied,
@@ -671,8 +681,14 @@ pub async fn delete_message(
                     Ok(imap) => {
                         let result = if !is_permanent && can_move_to_remote_trash {
                             let trash = trash_folder.as_ref().expect("checked above");
-                            imap.move_message(&source_folder.remote_id, uid, &trash.remote_id)
-                                .await
+                            crate::patch::imap_move::move_message_and_update_uid(
+                                &imap,
+                                &state.store,
+                                &msg,
+                                &source_folder.remote_id,
+                                &trash.remote_id,
+                            )
+                            .await
                         } else {
                             imap.delete_message(&source_folder.remote_id, uid).await
                         };
@@ -890,12 +906,17 @@ pub async fn restore_message(
                 RemoteMutationOutcome::LocalOnly
             } else {
                 let source_folder = source_folder.as_ref().expect("checked above");
-                let uid = parse_imap_uid(&msg.remote_id)?;
+                let _uid = parse_imap_uid(&msg.remote_id)?;
                 match connect_imap(&state, &msg.account_id).await {
                     Ok(imap) => {
-                        let result = imap
-                            .move_message(&source_folder.remote_id, uid, &inbox.remote_id)
-                            .await;
+                        let result = crate::patch::imap_move::move_message_and_update_uid(
+                            &imap,
+                            &state.store,
+                            &msg,
+                            &source_folder.remote_id,
+                            &inbox.remote_id,
+                        )
+                        .await;
                         let _ = imap.disconnect().await;
                         match result {
                             Ok(()) => RemoteMutationOutcome::Applied,
@@ -1039,9 +1060,14 @@ pub async fn move_to_folder(
             } else if let Ok(uid) = msg.remote_id.parse::<u32>() {
                 match connect_imap(&state, &msg.account_id).await {
                     Ok(imap) => {
-                        let result = imap
-                            .move_message(&source_folder.remote_id, uid, &target_folder.remote_id)
-                            .await;
+                        let result = crate::patch::imap_move::move_message_and_update_uid(
+                            &imap,
+                            &state.store,
+                            &msg,
+                            &source_folder.remote_id,
+                            &target_folder.remote_id,
+                        )
+                        .await;
                         let _ = imap.disconnect().await;
                         match result {
                             Ok(()) => {

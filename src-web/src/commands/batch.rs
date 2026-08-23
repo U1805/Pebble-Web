@@ -109,6 +109,15 @@ pub async fn batch_archive(
     let mut success_count: u32 = 0;
     let mut archived_ids = Vec::new();
 
+    // Validate every account before applying any mutations so a mixed-account
+    // batch cannot be partially archived before an unsafe local IMAP target is
+    // discovered.
+    for (account_id, (provider_type, _)) in &groups {
+        if let Ok(archive) = find_folder_by_role(&state, account_id, FolderRole::Archive) {
+            crate::patch::archive::reject_unsafe_imap_local_archive(provider_type, &archive)?;
+        }
+    }
+
     for (account_id, (provider_type, messages)) in &groups {
         let archive_folder = find_folder_by_role(&state, account_id, FolderRole::Archive).ok();
 
@@ -193,13 +202,18 @@ pub async fn batch_archive(
                                 continue;
                             };
                             for msg in messages {
-                                if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
+                                if let Ok(_uid) = parse_imap_uid(&msg.remote_id) {
                                     if let Ok(src) =
                                         find_message_folder(&state, &msg.id, account_id)
                                     {
-                                        match imap
-                                            .move_message(&src.remote_id, uid, &af.remote_id)
-                                            .await
+                                        match crate::patch::imap_move::move_message_and_update_uid(
+                                            imap,
+                                            &state.store,
+                                            msg,
+                                            &src.remote_id,
+                                            &af.remote_id,
+                                        )
+                                        .await
                                         {
                                             Ok(_) => remote_succeeded.push(msg.id.clone()),
                                             Err(e) => {
@@ -324,6 +338,12 @@ pub async fn batch_delete(
     let Some(groups) = prepare_batch(state.store.clone(), &message_ids).await? else {
         return Ok(0);
     };
+    let messages: Vec<Message> = groups
+        .values()
+        .flat_map(|(_, messages)| messages.iter().cloned())
+        .collect();
+    let delete_plan =
+        crate::patch::batch_delete::BatchDeletePlan::capture(&state.store, &messages)?;
 
     // Track which messages were successfully deleted remotely
     let mut deleted_ids: Vec<String> = Vec::new();
@@ -340,15 +360,20 @@ pub async fn batch_delete(
                 match &conn {
                     ConnectedProvider::Gmail(provider) => {
                         for msg in messages {
-                            match provider.trash_message(&msg.remote_id).await {
+                            let result = if delete_plan.is_permanent(&msg.id) {
+                                provider.delete_message_permanently(&msg.remote_id).await
+                            } else {
+                                provider.trash_message(&msg.remote_id).await
+                            };
+                            match result {
                                 Ok(_) => deleted_ids.push(msg.id.clone()),
                                 Err(e) => {
                                     warn!("Gmail batch delete failed for {}: {e}", msg.id);
                                     queue_batch_pending_op(
                                         &state,
                                         msg,
-                                        "delete",
-                                        json!({ "trash": true }),
+                                        delete_plan.pending_op_type(&msg.id),
+                                        delete_plan.pending_payload(&msg.id),
                                         &e.to_string(),
                                     )?;
                                 }
@@ -357,28 +382,47 @@ pub async fn batch_delete(
                     }
                     ConnectedProvider::Outlook(provider) => {
                         for msg in messages {
-                            match provider.trash_message(&msg.remote_id).await {
-                                Ok(new_remote_id) => {
-                                    if let Err(e) = record_remote_success_after_remote_id_update(
-                                        &msg.id,
-                                        state.store.update_remote_id(&msg.id, &new_remote_id),
-                                        &mut deleted_ids,
-                                    ) {
+                            if delete_plan.is_permanent(&msg.id) {
+                                match provider.delete_message_permanently(&msg.remote_id).await {
+                                    Ok(()) => deleted_ids.push(msg.id.clone()),
+                                    Err(e) => {
                                         warn!(
-                                            "Outlook batch delete applied remotely but failed to store new remote_id for {}: {e}",
+                                            "Outlook batch permanent delete failed for {}: {e}",
                                             msg.id
                                         );
+                                        queue_batch_pending_op(
+                                            &state,
+                                            msg,
+                                            delete_plan.pending_op_type(&msg.id),
+                                            delete_plan.pending_payload(&msg.id),
+                                            &e.to_string(),
+                                        )?;
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Outlook batch delete failed for {}: {e}", msg.id);
-                                    queue_batch_pending_op(
-                                        &state,
-                                        msg,
-                                        "delete",
-                                        json!({ "trash": true }),
-                                        &e.to_string(),
-                                    )?;
+                            } else {
+                                match provider.trash_message(&msg.remote_id).await {
+                                    Ok(new_remote_id) => {
+                                        if let Err(e) = record_remote_success_after_remote_id_update(
+                                            &msg.id,
+                                            state.store.update_remote_id(&msg.id, &new_remote_id),
+                                            &mut deleted_ids,
+                                        ) {
+                                            warn!(
+                                                "Outlook batch delete applied remotely but failed to store new remote_id for {}: {e}",
+                                                msg.id
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Outlook batch delete failed for {}: {e}", msg.id);
+                                        queue_batch_pending_op(
+                                            &state,
+                                            msg,
+                                            delete_plan.pending_op_type(&msg.id),
+                                            delete_plan.pending_payload(&msg.id),
+                                            &e.to_string(),
+                                        )?;
+                                    }
                                 }
                             }
                         }
@@ -393,13 +437,14 @@ pub async fn batch_delete(
                                         find_message_folder(&state, &msg.id, account_id)
                                     {
                                         if src.id != trash_folder.id {
-                                            match imap
-                                                .move_message(
-                                                    &src.remote_id,
-                                                    uid,
-                                                    &trash_folder.remote_id,
-                                                )
-                                                .await
+                                            match crate::patch::imap_move::move_message_and_update_uid(
+                                                imap,
+                                                &state.store,
+                                                msg,
+                                                &src.remote_id,
+                                                &trash_folder.remote_id,
+                                            )
+                                            .await
                                             {
                                                 Ok(_) => deleted_ids.push(msg.id.clone()),
                                                 Err(e) => {
@@ -470,11 +515,13 @@ pub async fn batch_delete(
                     queue_batch_pending_op(
                         &state,
                         msg,
-                        "delete",
-                        json!({ "trash": true }),
+                        delete_plan.pending_op_type(&msg.id),
+                        delete_plan.pending_payload(&msg.id),
                         &error,
                     )?;
-                    queued_for_local_commit_ids.push(msg.id.clone());
+                    if !delete_plan.is_permanent(&msg.id) {
+                        queued_for_local_commit_ids.push(msg.id.clone());
+                    }
                 }
             }
         }
@@ -486,14 +533,15 @@ pub async fn batch_delete(
     let ids_to_delete =
         batch_local_commit_ids(&message_ids, &deleted_ids, &queued_for_local_commit_ids);
 
-    // Local bulk soft-delete
-    state.store.bulk_soft_delete(&ids_to_delete)?;
+    let finalized = delete_plan.finalize(&state.store, &ids_to_delete)?;
     let success_count = ids_to_delete.len() as u32;
 
-    // Update search index: remove deleted messages.
-    let delete_ids: Vec<String> = ids_to_delete.clone();
+    refresh_search_documents(&state, &finalized.visible_ids)?;
+
+    // Update search index only for messages that are no longer locally visible.
+    let delete_ids = finalized.removed_ids;
     let _ = state.store.add_search_pending(&delete_ids, "remove");
-    for id in &ids_to_delete {
+    for id in &delete_ids {
         if let Err(e) = state.search.remove_message(id) {
             warn!("Failed to remove deleted message {id} from search index: {e}");
         }

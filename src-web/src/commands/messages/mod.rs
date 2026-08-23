@@ -237,11 +237,7 @@ pub(super) fn find_folder_by_role(
     account_id: &str,
     role: FolderRole,
 ) -> std::result::Result<pebble_core::Folder, PebbleError> {
-    state
-        .store
-        .list_folders(account_id)?
-        .into_iter()
-        .find(|folder| folder.role == Some(role.clone()))
+    crate::patch::folders::find_preferred_folder_by_role(&state.store, account_id, role.clone())?
         .ok_or_else(|| PebbleError::Internal(format!("No {:?} folder found", role)))
 }
 

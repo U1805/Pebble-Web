@@ -18,22 +18,52 @@ use oauth2::{
 use pebble_core::{
     new_id, now_timestamp, Account, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType,
 };
-use pebble_oauth::{
-    build_http_client, OAuthConfig, OAuthNetworkConfig, PkceState, TokenPair,
-};
+use pebble_oauth::{build_http_client, OAuthConfig, OAuthNetworkConfig, PkceState, TokenPair};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 
 use crate::account_colors::default_account_color;
-use crate::commands::network;
 use crate::blocking::run_blocking;
+use crate::commands::network;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
 const PENDING_OAUTH_TTL_SECS: i64 = 5 * 60;
 const OAUTH_TERMINAL_STATUS_RETENTION_SECS: i64 = 10 * 60;
 const CALLBACK_PATH: &str = "/api/v1/oauth/callback";
+
+#[cfg(debug_assertions)]
+fn oauth_test_base_url() -> Option<String> {
+    std::env::var("PEBBLE_OAUTH_TEST_BASE_URL")
+        .ok()
+        .map(|value| value.trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn oauth_test_base_url() -> Option<String> {
+    None
+}
+
+fn oauth_provider_url(provider: &str, endpoint: &str, production_url: &str) -> String {
+    let test_base = oauth_test_base_url();
+    oauth_provider_url_with_test_base(test_base.as_deref(), provider, endpoint, production_url)
+}
+
+fn oauth_provider_url_with_test_base(
+    test_base: Option<&str>,
+    provider: &str,
+    endpoint: &str,
+    production_url: &str,
+) -> String {
+    test_base
+        .map(str::trim)
+        .map(|base| base.trim_end_matches('/'))
+        .filter(|base| !base.is_empty())
+        .map(|base| format!("{base}/{provider}/{endpoint}"))
+        .unwrap_or_else(|| production_url.to_string())
+}
 
 fn parse_web_oauth_urls(
     config: &OAuthConfig,
@@ -52,6 +82,7 @@ fn parse_web_oauth_urls(
 /// shared OAuth manager intentionally keeps its desktop localhost redirect;
 /// this transport-local helper avoids changing that upstream-facing contract.
 fn start_web_oauth(
+    provider: &str,
     config: &OAuthConfig,
     redirect_url: &str,
 ) -> Result<(String, PkceState), String> {
@@ -74,6 +105,9 @@ fn start_web_oauth(
         .set_pkce_challenge(challenge);
     for scope in &config.scopes {
         request = request.add_scope(Scope::new(scope.clone()));
+    }
+    for &(key, value) in crate::patch::gmail_oauth::authorization_extra_params(provider) {
+        request = request.add_extra_param(key, value);
     }
     let (authorization_url, csrf_token) = request.url();
     Ok((
@@ -267,7 +301,9 @@ pub(crate) async fn oauth_callback_status(
     crate::auth::require_auth(&state, &headers)?;
     let state_key = args.state.trim();
     if state_key.is_empty() {
-        return Err(ApiError::BadRequest("OAuth callback status requires state".to_string()));
+        return Err(ApiError::BadRequest(
+            "OAuth callback status requires state".to_string(),
+        ));
     }
     let now = now_timestamp();
     {
@@ -289,8 +325,7 @@ pub(crate) async fn oauth_callback_status(
 
     let mut statuses = state.oauth_flow_status.lock().await;
     statuses.retain(|_, status| {
-        status.is_processing()
-            || status.updated_at() + OAUTH_TERMINAL_STATUS_RETENTION_SECS > now
+        status.is_processing() || status.updated_at() + OAUTH_TERMINAL_STATUS_RETENTION_SECS > now
     });
     if let Some(status) = statuses.get(state_key) {
         return Ok(Json(status.response_json()));
@@ -315,7 +350,7 @@ pub(crate) async fn start_oauth_flow(state: AppStateRef, args: Value) -> Result<
     let network = OAuthNetworkConfig {
         proxy: effective_proxy,
     };
-    let (authorization_url, pkce_state) = start_web_oauth(&config, &redirect_url)
+    let (authorization_url, pkce_state) = start_web_oauth(&provider, &config, &redirect_url)
         .map_err(|e| ApiError::BadRequest(format!("failed to start {provider} OAuth: {e}")))?;
     let state_key = pkce_state.csrf_token.secret().to_string();
 
@@ -531,16 +566,22 @@ async fn fetch_userinfo(
     network: &OAuthNetworkConfig,
 ) -> Result<(String, String), String> {
     let url = match provider {
-        "gmail" => "https://www.googleapis.com/oauth2/v2/userinfo",
-        "outlook" => {
-            "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName"
-        }
+        "gmail" => oauth_provider_url(
+            "gmail",
+            "userinfo",
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+        ),
+        "outlook" => oauth_provider_url(
+            "outlook",
+            "userinfo",
+            "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName",
+        ),
         _ => return Err(format!("unsupported OAuth provider: {provider}")),
     };
-    let client = build_http_client(network)
-        .map_err(|e| format!("Userinfo HTTP client failed: {e}"))?;
+    let client =
+        build_http_client(network).map_err(|e| format!("Userinfo HTTP client failed: {e}"))?;
     let value: Value = client
-        .get(url)
+        .get(&url)
         .bearer_auth(access_token)
         .send()
         .await
@@ -682,8 +723,12 @@ pub(crate) fn gmail_oauth_config() -> OAuthConfig {
             "GOOGLE_CLIENT_SECRET",
             option_env!("GOOGLE_CLIENT_SECRET"),
         ),
-        auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
-        token_url: "https://oauth2.googleapis.com/token".to_string(),
+        auth_url: oauth_provider_url(
+            "gmail",
+            "authorize",
+            "https://accounts.google.com/o/oauth2/v2/auth",
+        ),
+        token_url: oauth_provider_url("gmail", "token", "https://oauth2.googleapis.com/token"),
         scopes: vec![
             "https://mail.google.com/".to_string(),
             "https://www.googleapis.com/auth/userinfo.email".to_string(),
@@ -704,8 +749,16 @@ pub(crate) fn outlook_oauth_config() -> OAuthConfig {
             "MICROSOFT_CLIENT_SECRET",
             option_env!("MICROSOFT_CLIENT_SECRET"),
         ),
-        auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
-        token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
+        auth_url: oauth_provider_url(
+            "outlook",
+            "authorize",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        ),
+        token_url: oauth_provider_url(
+            "outlook",
+            "token",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
         scopes: vec![
             "https://graph.microsoft.com/Mail.ReadWrite".to_string(),
             "https://graph.microsoft.com/Mail.Send".to_string(),
@@ -821,4 +874,294 @@ fn callback_page(payload: Value) -> Response {
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(axum::body::Body::from(html))
         .expect("OAuth callback response should be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use http_body_util::BodyExt;
+
+    struct TestState {
+        state: AppStateRef,
+        data_dir: std::path::PathBuf,
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
+    }
+
+    fn test_state() -> TestState {
+        let data_dir =
+            std::env::temp_dir().join(format!("pebble-web-oauth-test-{}", uuid::Uuid::new_v4()));
+        let config = crate::config::Config {
+            port: 0,
+            data_dir: data_dir.clone(),
+            password_hash: crate::auth::hash_password("oauth-test-password").unwrap(),
+            jwt_secret: "oauth-test-jwt-secret-with-at-least-32-characters".to_string(),
+            sync_interval_secs: 300,
+            static_dir: data_dir.join("static"),
+        };
+        TestState {
+            state: crate::state::AppState::init(config).unwrap(),
+            data_dir,
+        }
+    }
+
+    fn authenticated_headers(state: &AppStateRef) -> HeaderMap {
+        let token = crate::auth::create_token(&state.config.jwt_secret, 1).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    async fn insert_pending_flow(state: &AppStateRef, created_at: i64) -> String {
+        let redirect_url = "https://mail.example.test/api/v1/oauth/callback";
+        let (_, pkce_state) = start_web_oauth("gmail", &test_oauth_config(), redirect_url).unwrap();
+        let state_key = pkce_state.csrf_token.secret().to_string();
+        state.oauth_pending.lock().await.insert(
+            state_key.clone(),
+            PendingOAuth {
+                provider: "gmail".to_string(),
+                email: "oauth@example.test".to_string(),
+                display_name: "OAuth Test".to_string(),
+                account_proxy: None,
+                redirect_url: redirect_url.to_string(),
+                config: test_oauth_config(),
+                network: OAuthNetworkConfig { proxy: None },
+                pkce_state: Some(pkce_state),
+                created_at,
+            },
+        );
+        state_key
+    }
+
+    fn test_oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: Some("test-secret".to_string()),
+            auth_url: "https://oauth.example.test/authorize".to_string(),
+            token_url: "https://oauth.example.test/token".to_string(),
+            scopes: vec!["mail.read".to_string(), "offline_access".to_string()],
+            redirect_port: 0,
+        }
+    }
+
+    #[test]
+    fn web_oauth_authorization_url_contains_state_pkce_redirect_and_scopes() {
+        let redirect_url = "https://mail.example.test/api/v1/oauth/callback";
+        let (authorization_url, pkce_state) =
+            start_web_oauth("gmail", &test_oauth_config(), redirect_url).unwrap();
+        let parsed = Url::parse(&authorization_url).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            parsed.as_str().split('?').next().unwrap(),
+            "https://oauth.example.test/authorize"
+        );
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("test-client")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some(redirect_url)
+        );
+        assert_eq!(
+            params.get("state").map(String::as_str),
+            Some(pkce_state.csrf_token.secret().as_str())
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("access_type").map(String::as_str),
+            Some("offline")
+        );
+        assert_eq!(params.get("prompt").map(String::as_str), Some("consent"));
+
+        let expected_challenge = PkceCodeChallenge::from_code_verifier_sha256(&pkce_state.verifier);
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some(expected_challenge.as_str())
+        );
+        let scopes: std::collections::HashSet<_> = params["scope"].split(' ').collect();
+        assert_eq!(
+            scopes,
+            std::collections::HashSet::from(["mail.read", "offline_access"])
+        );
+    }
+
+    #[test]
+    fn controllable_oauth_base_only_replaces_provider_endpoints() {
+        assert_eq!(
+            oauth_provider_url_with_test_base(
+                Some(" http://127.0.0.1:9091/ "),
+                "gmail",
+                "token",
+                "https://oauth2.googleapis.com/token",
+            ),
+            "http://127.0.0.1:9091/gmail/token"
+        );
+        assert_eq!(
+            oauth_provider_url_with_test_base(
+                None,
+                "outlook",
+                "authorize",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            ),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        );
+        assert_eq!(
+            oauth_provider_url_with_test_base(
+                Some("  "),
+                "gmail",
+                "userinfo",
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+            ),
+            "https://www.googleapis.com/oauth2/v2/userinfo"
+        );
+    }
+
+    #[test]
+    fn oauth_state_comparison_rejects_changes_and_length_mismatches() {
+        assert!(constant_time_eq("one-time-state", "one-time-state"));
+        assert!(!constant_time_eq("one-time-state", "one-time-statf"));
+        assert!(!constant_time_eq("one-time-state", "short"));
+    }
+
+    #[tokio::test]
+    async fn callback_status_cancellation_atomically_expires_pending_state() {
+        let test = test_state();
+        let state_key = insert_pending_flow(&test.state, now_timestamp()).await;
+        let headers = authenticated_headers(&test.state);
+
+        let Json(pending) = oauth_callback_status(
+            State(test.state.clone()),
+            headers.clone(),
+            Json(OAuthCallbackStatusArgs {
+                state: state_key.clone(),
+                cancel_pending: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending, json!({ "status": "pending" }));
+
+        let Json(cancelled) = oauth_callback_status(
+            State(test.state.clone()),
+            headers,
+            Json(OAuthCallbackStatusArgs {
+                state: state_key.clone(),
+                cancel_pending: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled, json!({ "status": "expired" }));
+        assert!(!test
+            .state
+            .oauth_pending
+            .lock()
+            .await
+            .contains_key(&state_key));
+
+        let replay = oauth_callback(
+            State(test.state.clone()),
+            Query(OAuthCallbackQuery {
+                state: Some(state_key),
+                code: Some("unused-code".to_string()),
+                error: None,
+                _error_description: None,
+            }),
+        )
+        .await;
+        let body = replay.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("invalid, expired, or already used"));
+    }
+
+    #[tokio::test]
+    async fn expired_pending_state_is_removed_before_callback() {
+        let test = test_state();
+        let state_key =
+            insert_pending_flow(&test.state, now_timestamp() - PENDING_OAUTH_TTL_SECS - 1).await;
+
+        let Json(status) = oauth_callback_status(
+            State(test.state.clone()),
+            authenticated_headers(&test.state),
+            Json(OAuthCallbackStatusArgs {
+                state: state_key.clone(),
+                cancel_pending: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, json!({ "status": "expired" }));
+        assert!(!test
+            .state
+            .oauth_pending
+            .lock()
+            .await
+            .contains_key(&state_key));
+    }
+
+    #[tokio::test]
+    async fn denied_callback_is_terminal_and_one_time() {
+        let test = test_state();
+        let state_key = insert_pending_flow(&test.state, now_timestamp()).await;
+
+        let denied = oauth_callback(
+            State(test.state.clone()),
+            Query(OAuthCallbackQuery {
+                state: Some(state_key.clone()),
+                code: None,
+                error: Some("access_denied".to_string()),
+                _error_description: None,
+            }),
+        )
+        .await;
+        let denied_body = denied.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&denied_body).contains("access_denied"));
+
+        let Json(status) = oauth_callback_status(
+            State(test.state.clone()),
+            authenticated_headers(&test.state),
+            Json(OAuthCallbackStatusArgs {
+                state: state_key.clone(),
+                cancel_pending: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["status"], "error");
+
+        let replay = oauth_callback(
+            State(test.state.clone()),
+            Query(OAuthCallbackQuery {
+                state: Some(state_key),
+                code: Some("unused-code".to_string()),
+                error: None,
+                _error_description: None,
+            }),
+        )
+        .await;
+        let replay_body = replay.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&replay_body).contains("invalid, expired, or already used"));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_ignores_oauth_test_base_url() {
+        assert_eq!(oauth_test_base_url(), None);
+    }
 }
