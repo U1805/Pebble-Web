@@ -1,0 +1,29 @@
+services:
+  pebble-web:
+    image: ghcr.io/u1805/pebble-web:latest
+    restart: unless-stopped
+    environment:
+      # Replace both placeholder values before starting the service.
+      PEBBLE_PASSWORD: changeme
+      PEBBLE_JWT_SECRET: change-this-to-a-random-string
+      PEBBLE_PORT: "8080"
+      PEBBLE_DATA_DIR: /data
+      PEBBLE_STATIC_DIR: /app/dist
+      PEBBLE_SYNC_INTERVAL: "300"
+
+      # Optional. Leave unset to generate and persist /data/encryption.key.
+      # PEBBLE_ENCRYPTION_KEY: ""
+
+      # Optional. Configure only the OAuth providers that are used.
+      # PEBBLE_OAUTH_REDIRECT_URL: http://localhost:8080/api/v1/oauth/callback
+      # GOOGLE_CLIENT_ID: your-client-id.apps.googleusercontent.com
+      # GOOGLE_CLIENT_SECRET: your-google-client-secret
+      # MICROSOFT_CLIENT_ID: your-microsoft-client-id
+      # MICROSOFT_CLIENT_SECRET: your-microsoft-client-secret
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - pebble-data:/data
+
+volumes:
+  pebble-data:

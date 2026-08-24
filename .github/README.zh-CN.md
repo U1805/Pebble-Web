@@ -20,9 +20,6 @@
   <a href="../LICENSE">AGPL-3.0</a>
 </p>
 
-> [!IMPORTANT]
-> 本项目仍在开发中。目前已完成主要桌面功能的 Web 语义对齐，但 Docker、部署文档、CI 和发布验证尚未完成。
-
 ## 项目定位
 
 本仓库是 [QingJ01/Pebble](https://github.com/QingJ01/Pebble) 的长期 Web fork。
@@ -61,6 +58,24 @@
 浏览器中不存在的桌面概念不会伪装成业务成功，例如系统托盘、开机启动、原生窗口控制和设置系统默认邮件客户端。
 
 更精确的桌面/Web 差异及实现见 [`src-web/README.md`](../src-web/README.md)。
+
+## 部署
+
+下载 Compose 配置：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/U1805/Pebble-Web/web/src-web/docker-compose.yaml
+```
+
+启动前编辑 `docker-compose.yaml`，至少设置 `PEBBLE_PASSWORD` 和不少于 32 个字符的 `PEBBLE_JWT_SECRET`。OAuth 环境变量仅在使用 Gmail 或 Outlook 时配置。
+
+启动服务：
+
+```bash
+docker-compose up -d
+```
+
+随后在浏览器访问 <http://localhost:8080>。
 
 ## 上游同步原则
 

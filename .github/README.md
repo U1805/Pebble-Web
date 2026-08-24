@@ -20,9 +20,6 @@
   <a href="../LICENSE">AGPL-3.0</a>
 </p>
 
-> [!IMPORTANT]
-> This project is still under development. Semantic alignment with the desktop app's major features is complete, but Docker support, deployment documentation, CI, and release verification are not yet finished.
-
 ## Project Positioning
 
 This repository is a long-term Web fork of [QingJ01/Pebble](https://github.com/QingJ01/Pebble).
@@ -61,6 +58,24 @@ The current Web adaptation covers the primary personal email workflows, includin
 Desktop concepts that do not exist in browsers—such as the system tray, launch at startup, native window controls, and setting the operating system's default email client—are not presented as successful business operations.
 
 For a more precise description of desktop/Web differences and their implementations, see [`src-web/README.md`](../src-web/README.md).
+
+## Deployment
+
+Download the Compose configuration:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/U1805/Pebble-Web/web/src-web/docker-compose.yaml
+```
+
+Before starting, edit `docker-compose.yaml` and set at least `PEBBLE_PASSWORD` and `PEBBLE_JWT_SECRET` of 32 characters or more. OAuth environment variables are only needed when using Gmail or Outlook.
+
+Start the service:
+
+```bash
+docker-compose up -d
+```
+
+Then open <http://localhost:8080> in a browser.
 
 ## Upstream Synchronization Principles
 
