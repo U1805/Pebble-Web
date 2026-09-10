@@ -4,9 +4,9 @@ use pebble_translate::TranslateService;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::blocking::run_blocking;
 use crate::commands::encrypted_store::{ACTIVE_TRANSLATE_CONFIG_ID, TRANSLATE_CONFIG_PURPOSE};
 use crate::commands::network::get_global_proxy_raw;
-use crate::blocking::run_blocking;
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 

@@ -24,7 +24,9 @@ pub(crate) fn refresh_search_documents(
     state: &AppState,
     message_ids: &[String],
 ) -> std::result::Result<(), PebbleError> {
-    if message_ids.is_empty() { return Ok(()); }
+    if message_ids.is_empty() {
+        return Ok(());
+    }
     state.store.add_search_pending(message_ids, "index")?;
     for message_id in message_ids {
         match state.store.get_message(message_id)? {
@@ -56,7 +58,9 @@ pub(crate) fn load_imap_config(
             .map_err(|e| PebbleError::Internal(format!("Failed to parse config: {e}")))?;
         let proxy_mode = account_proxy_mode_from_auth_value(&value);
         let config = serde_json::from_value(value.get("imap").cloned().unwrap_or(value.clone()))
-            .map_err(|e| PebbleError::Internal(format!("Failed to deserialize IMAP config: {e}")))?;
+            .map_err(|e| {
+                PebbleError::Internal(format!("Failed to deserialize IMAP config: {e}"))
+            })?;
         (config, proxy_mode)
     } else {
         let sync_state = store
@@ -65,8 +69,9 @@ pub(crate) fn load_imap_config(
         let imap_value = sync_state.imap.ok_or_else(|| {
             PebbleError::Internal(format!("No IMAP config for account {account_id}"))
         })?;
-        let config = serde_json::from_value(imap_value)
-            .map_err(|e| PebbleError::Internal(format!("Failed to deserialize IMAP config: {e}")))?;
+        let config = serde_json::from_value(imap_value).map_err(|e| {
+            PebbleError::Internal(format!("Failed to deserialize IMAP config: {e}"))
+        })?;
         (config, AccountProxyMode::Inherit)
     };
     config.proxy = resolve_mail_proxy_from_mode(crypto, store, proxy_mode, config.proxy)?;
@@ -90,7 +95,9 @@ pub(crate) fn load_pop3_config(
         .map_err(|e| PebbleError::Internal(format!("Failed to deserialize POP3 config: {e}")))?;
         (config, proxy_mode)
     } else {
-        return Err(PebbleError::Internal(format!("No POP3 config for account {account_id}")));
+        return Err(PebbleError::Internal(format!(
+            "No POP3 config for account {account_id}"
+        )));
     };
     let proxy = resolve_mail_proxy_from_mode(crypto, store, proxy_mode, imap_config.proxy)?;
     Ok(Pop3Config {
@@ -103,7 +110,6 @@ pub(crate) fn load_pop3_config(
         proxy,
     })
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RemoteMutationOutcome {
@@ -187,7 +193,8 @@ pub(super) async fn connect_gmail(
     state: &AppState,
     account_id: &str,
 ) -> std::result::Result<GmailProvider, PebbleError> {
-    let auth = crate::commands::oauth::ensure_account_oauth_auth(state, account_id, "gmail").await?;
+    let auth =
+        crate::commands::oauth::ensure_account_oauth_auth(state, account_id, "gmail").await?;
     GmailProvider::new_with_proxy(auth.tokens.access_token, auth.proxy)
 }
 
@@ -195,7 +202,8 @@ pub(super) async fn connect_outlook(
     state: &AppState,
     account_id: &str,
 ) -> std::result::Result<OutlookProvider, PebbleError> {
-    let auth = crate::commands::oauth::ensure_account_oauth_auth(state, account_id, "outlook").await?;
+    let auth =
+        crate::commands::oauth::ensure_account_oauth_auth(state, account_id, "outlook").await?;
     OutlookProvider::new_with_proxy(auth.tokens.access_token, account_id.to_string(), auth.proxy)
 }
 

@@ -18,7 +18,8 @@ use crate::error::ApiError;
 use crate::state::AppStateRef;
 
 pub(crate) const MAX_BACKGROUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-pub(crate) const MAX_BACKGROUND_MULTIPART_BODY_BYTES: usize = MAX_BACKGROUND_IMAGE_BYTES + 1024 * 1024;
+pub(crate) const MAX_BACKGROUND_MULTIPART_BODY_BYTES: usize =
+    MAX_BACKGROUND_IMAGE_BYTES + 1024 * 1024;
 const BACKGROUND_IMAGE_URL_PREFIX: &str = "/api/v1/background-images/";
 
 #[derive(Debug, Clone, Serialize)]

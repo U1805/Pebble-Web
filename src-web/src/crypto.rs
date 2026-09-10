@@ -24,14 +24,18 @@ pub fn load_or_create_crypto(data_dir: &Path) -> Result<CryptoService, String> {
         path = %data_dir.join("encryption.key").display(),
         "no DEK found, generating and persisting new one"
     );
-    std::fs::create_dir_all(data_dir)
-        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("Failed to create data dir: {e}"))?;
     // Linux 容器内限制文件权限，避免同机其他用户读到明文密钥
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(data_dir.join("encryption.key"), hex_str.as_bytes())
-            .and_then(|_| std::fs::set_permissions(data_dir.join("encryption.key"), std::fs::Permissions::from_mode(0o600)))
+            .and_then(|_| {
+                std::fs::set_permissions(
+                    data_dir.join("encryption.key"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+            })
             .map_err(|e| format!("Failed to persist DEK: {e}"))?;
     }
     #[cfg(not(unix))]
@@ -58,8 +62,8 @@ fn load_dek_from_file(path: &Path) -> Result<Option<[u8; 32]>, String> {
 }
 
 fn decode_hex_key(hex_key: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex_key)
-        .map_err(|e| format!("Invalid PEBBLE_ENCRYPTION_KEY hex: {e}"))?;
+    let bytes =
+        hex::decode(hex_key).map_err(|e| format!("Invalid PEBBLE_ENCRYPTION_KEY hex: {e}"))?;
     if bytes.len() != 32 {
         return Err(format!(
             "PEBBLE_ENCRYPTION_KEY must decode to 32 bytes, got {}",

@@ -13,7 +13,6 @@ use crate::commands::{encrypted_store, kanban, translate};
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
-
 /// 备份文件导出参数（后端 snake_case 契约，调用层已由前端转换）。
 #[derive(Deserialize)]
 pub struct ExportArgs {
@@ -226,12 +225,8 @@ pub(crate) fn restore_backup_data(
 
     let backup_secrets = decrypt_secrets_from_backup(&backup, secret_passphrase)?;
     let restored_secrets = backup_secrets.is_some();
-    let private_data = prepare_restored_private_data(
-        state,
-        &backup,
-        has_kanban_context_notes,
-        backup_secrets,
-    )?;
+    let private_data =
+        prepare_restored_private_data(state, &backup, has_kanban_context_notes, backup_secrets)?;
 
     state
         .store

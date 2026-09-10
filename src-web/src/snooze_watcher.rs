@@ -10,10 +10,7 @@ use crate::events;
 
 /// Run the Web snooze watcher on the same cadence and housekeeping schedule
 /// as the desktop watcher. WebSocket delivery replaces the desktop OS event.
-pub async fn run_snooze_watcher(
-    store: Arc<Store>,
-    ws_broadcast: broadcast::Sender<String>,
-) {
+pub async fn run_snooze_watcher(store: Arc<Store>, ws_broadcast: broadcast::Sender<String>) {
     const INTERVAL: Duration = Duration::from_secs(30);
     const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
     const TOMBSTONE_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
@@ -58,10 +55,7 @@ pub async fn run_snooze_watcher(
 }
 
 /// Expire due snoozes and broadcast the shared `mail:unsnoozed` event.
-pub async fn process_due_snoozes(
-    store: Arc<Store>,
-    ws_broadcast: broadcast::Sender<String>,
-) {
+pub async fn process_due_snoozes(store: Arc<Store>, ws_broadcast: broadcast::Sender<String>) {
     let query_store = store.clone();
     let due = match tokio::task::spawn_blocking(move || {
         query_store.get_due_snoozed(pebble_core::now_timestamp())
@@ -87,9 +81,13 @@ pub async fn process_due_snoozes(
                 let notification_body = {
                     let lookup_store = store.clone();
                     let lookup_id = snoozed.message_id.clone();
-                    match tokio::task::spawn_blocking(move || lookup_store.get_message(&lookup_id)).await {
+                    match tokio::task::spawn_blocking(move || lookup_store.get_message(&lookup_id))
+                        .await
+                    {
                         Ok(Ok(Some(message))) if message.from_name.is_empty() => message.subject,
-                        Ok(Ok(Some(message))) => format!("{}: {}", message.from_name, message.subject),
+                        Ok(Ok(Some(message))) => {
+                            format!("{}: {}", message.from_name, message.subject)
+                        }
                         _ => snoozed.message_id.clone(),
                     }
                 };

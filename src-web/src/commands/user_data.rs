@@ -1,17 +1,16 @@
-use pebble_core::{new_id, now_timestamp, PebbleError};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
 use crate::blocking::run_blocking;
 use crate::commands::encrypted_store::{
     load_secure_user_data, lock_secure_user_data_key, store_secure_user_data,
 };
 use crate::error::ApiError;
 use crate::state::AppStateRef;
+use pebble_core::{new_id, now_timestamp, PebbleError};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
 const EMAIL_TEMPLATES_KEY: &str = "email_templates";
 const EMAIL_SIGNATURES_KEY: &str = "email_signatures";
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

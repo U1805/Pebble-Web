@@ -852,8 +852,6 @@ pub async fn batch_star(
     Ok(success_count)
 }
 
-
-
 pub async fn dispatch_command(
     state: AppStateRef,
     command: &str,
@@ -864,7 +862,9 @@ pub async fn dispatch_command(
     match command {
         "batch_archive" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_ids: Vec<String> }
+            struct Args {
+                message_ids: Vec<String>,
+            }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid batch_archive args: {error}"))
             })?;
@@ -875,7 +875,9 @@ pub async fn dispatch_command(
         }
         "batch_delete" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_ids: Vec<String> }
+            struct Args {
+                message_ids: Vec<String>,
+            }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid batch_delete args: {error}"))
             })?;
@@ -886,7 +888,10 @@ pub async fn dispatch_command(
         }
         "batch_mark_read" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_ids: Vec<String>, is_read: bool }
+            struct Args {
+                message_ids: Vec<String>,
+                is_read: bool,
+            }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid batch_mark_read args: {error}"))
             })?;
@@ -897,7 +902,10 @@ pub async fn dispatch_command(
         }
         "batch_star" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_ids: Vec<String>, starred: bool }
+            struct Args {
+                message_ids: Vec<String>,
+                starred: bool,
+            }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid batch_star args: {error}"))
             })?;

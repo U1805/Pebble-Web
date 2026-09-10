@@ -1,10 +1,11 @@
 use crate::state::{AppState, AppStateRef};
-use pebble_core::{
-    traits::DraftProvider, DraftMessage, EmailAddress, PebbleError, ProviderType,
-};
+use pebble_core::{traits::DraftProvider, DraftMessage, EmailAddress, PebbleError, ProviderType};
 use tracing::warn;
 
-use super::attachments::{cleanup_local_attachment_records, stage_local_attachment_records, validate_staged_attachment_paths};
+use super::attachments::{
+    cleanup_local_attachment_records, stage_local_attachment_records,
+    validate_staged_attachment_paths,
+};
 use super::messages::provider_dispatch::ConnectedProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,8 +300,7 @@ fn save_draft_locally(
         .into_iter()
         .filter_map(|attachment| attachment.local_path)
         .collect();
-    let drafts_folder =
-        crate::patch::drafts::ensure_local_drafts_folder(&state.store, account_id)?;
+    let drafts_folder = crate::patch::drafts::ensure_local_drafts_folder(&state.store, account_id)?;
     let attachment_records =
         stage_local_attachment_records(&state.attachments_dir, &id, &draft.attachment_paths)?;
 
@@ -387,8 +387,6 @@ pub async fn delete_draft(
     Ok(())
 }
 
-
-
 pub async fn dispatch_command(
     state: AppStateRef,
     command: &str,
@@ -405,10 +403,14 @@ pub async fn dispatch_command(
                 bcc: Vec<String>,
                 subject: String,
                 body_text: String,
-                #[serde(default)] body_html: Option<String>,
-                #[serde(default)] in_reply_to: Option<String>,
-                #[serde(default)] attachment_paths: Option<Vec<String>>,
-                #[serde(default)] existing_draft_id: Option<String>,
+                #[serde(default)]
+                body_html: Option<String>,
+                #[serde(default)]
+                in_reply_to: Option<String>,
+                #[serde(default)]
+                attachment_paths: Option<Vec<String>>,
+                #[serde(default)]
+                existing_draft_id: Option<String>,
             }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid save_draft args: {error}"))
@@ -432,7 +434,10 @@ pub async fn dispatch_command(
         }
         "delete_draft" => {
             #[derive(serde::Deserialize)]
-            struct Args { account_id: String, draft_id: String }
+            struct Args {
+                account_id: String,
+                draft_id: String,
+            }
             let args: Args = serde_json::from_value(args).map_err(|error| {
                 ApiError::BadRequest(format!("invalid delete_draft args: {error}"))
             })?;

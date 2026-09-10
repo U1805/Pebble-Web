@@ -20,7 +20,12 @@ fn main() {
     let version = fs::read_to_string(&package_json)
         .ok()
         .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|value| value.get("version").and_then(|version| version.as_str()).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("version")
+                .and_then(|version| version.as_str())
+                .map(str::to_owned)
+        })
         .filter(|version| !version.trim().is_empty())
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()));
 

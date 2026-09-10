@@ -52,8 +52,9 @@ fn persist_poll_interval(
     store: &Store,
     interval: u64,
 ) -> Result<(), PebbleError> {
-    let bytes = serde_json::to_vec(&interval)
-        .map_err(|error| PebbleError::Internal(format!("Failed to serialize realtime preference: {error}")))?;
+    let bytes = serde_json::to_vec(&interval).map_err(|error| {
+        PebbleError::Internal(format!("Failed to serialize realtime preference: {error}"))
+    })?;
     crate::commands::encrypted_store::store_secure_user_data(
         crypto,
         store,
@@ -315,10 +316,7 @@ impl SyncManager {
         let mut started_count = 0usize;
         let mut failures = Vec::new();
         for account in accounts {
-            match self
-                .start_account(account.id.clone(), Some(interval))
-                .await
-            {
+            match self.start_account(account.id.clone(), Some(interval)).await {
                 Ok(()) => started_count += 1,
                 Err(error) => failures.push((account.id, error.to_string())),
             }
@@ -354,19 +352,22 @@ impl SyncManager {
 
         let task = match account.provider {
             ProviderType::Gmail => {
-                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(&self.crypto, &self.store, &account_id)
-                    .map_err(|error| {
-                        emit_realtime_status_to(
-                            &broadcast,
-                            &account_id,
-                            &ProviderType::Gmail,
-                            "auth_required",
-                            None,
-                            None,
-                            Some(error.to_string()),
-                        );
-                        error
-                    })?;
+                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(
+                    &self.crypto,
+                    &self.store,
+                    &account_id,
+                )
+                .inspect_err(|error| {
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Gmail,
+                        "auth_required",
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    );
+                })?;
                 let expires_at = tokens.expires_at;
                 let provider = Arc::new(GmailProvider::new_with_proxy(
                     tokens.access_token.clone(),
@@ -382,8 +383,10 @@ impl SyncManager {
                     account_id.clone(),
                 );
                 tokio::spawn(async move {
-                    let mut config = SyncConfig::default();
-                    config.poll_interval_secs = poll_interval_secs;
+                    let config = SyncConfig {
+                        poll_interval_secs,
+                        ..Default::default()
+                    };
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
@@ -410,19 +413,22 @@ impl SyncManager {
                 })
             }
             ProviderType::Outlook => {
-                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(&self.crypto, &self.store, &account_id)
-                    .map_err(|error| {
-                        emit_realtime_status_to(
-                            &broadcast,
-                            &account_id,
-                            &ProviderType::Outlook,
-                            "auth_required",
-                            None,
-                            None,
-                            Some(error.to_string()),
-                        );
-                        error
-                    })?;
+                let tokens = crate::commands::oauth::decode_oauth_account_tokens_raw(
+                    &self.crypto,
+                    &self.store,
+                    &account_id,
+                )
+                .inspect_err(|error| {
+                    emit_realtime_status_to(
+                        &broadcast,
+                        &account_id,
+                        &ProviderType::Outlook,
+                        "auth_required",
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    );
+                })?;
                 let expires_at = tokens.expires_at;
                 let provider = Arc::new(OutlookProvider::new_with_proxy(
                     tokens.access_token.clone(),
@@ -439,8 +445,10 @@ impl SyncManager {
                     account_id.clone(),
                 );
                 tokio::spawn(async move {
-                    let mut config = SyncConfig::default();
-                    config.poll_interval_secs = poll_interval_secs;
+                    let config = SyncConfig {
+                        poll_interval_secs,
+                        ..Default::default()
+                    };
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
@@ -471,7 +479,7 @@ impl SyncManager {
                     &self.crypto,
                     &account_id,
                 )
-                .map_err(|error| {
+                .inspect_err(|error| {
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
@@ -481,17 +489,22 @@ impl SyncManager {
                         None,
                         Some(error.to_string()),
                     );
-                    error
                 })?;
                 let provider = Arc::new(Pop3Provider::new(pop3_config));
                 tokio::spawn(async move {
-                    let mut config = SyncConfig::default();
-                    config.poll_interval_secs = poll_interval_secs;
+                    let config = SyncConfig {
+                        poll_interval_secs,
+                        ..Default::default()
+                    };
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
                         &ProviderType::Pop3,
-                        if config.manual_only() { "manual" } else { "polling" },
+                        if config.manual_only() {
+                            "manual"
+                        } else {
+                            "polling"
+                        },
                         Some(now_timestamp_secs()),
                         None,
                         Some(polling_status_message(&config)),
@@ -517,7 +530,7 @@ impl SyncManager {
                     &self.crypto,
                     &account_id,
                 )
-                .map_err(|error| {
+                .inspect_err(|error| {
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
@@ -527,17 +540,22 @@ impl SyncManager {
                         None,
                         Some(error.to_string()),
                     );
-                    error
                 })?;
                 let provider = Arc::new(ImapMailProvider::new(imap_config));
                 tokio::spawn(async move {
-                    let mut config = SyncConfig::default();
-                    config.poll_interval_secs = poll_interval_secs;
+                    let config = SyncConfig {
+                        poll_interval_secs,
+                        ..Default::default()
+                    };
                     emit_realtime_status_to(
                         &broadcast,
                         &account_id,
                         &ProviderType::Imap,
-                        if config.manual_only() { "manual" } else { "polling" },
+                        if config.manual_only() {
+                            "manual"
+                        } else {
+                            "polling"
+                        },
                         Some(now_timestamp_secs()),
                         None,
                         Some(polling_status_message(&config)),
@@ -600,10 +618,8 @@ impl SyncManager {
         mpsc::UnboundedSender<pebble_mail::StoredMessage>,
     ) {
         let (error_tx, mut error_rx) = mpsc::unbounded_channel::<pebble_mail::SyncError>();
-        let (progress_tx, mut progress_rx) =
-            mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
-        let (message_tx, mut message_rx) =
-            mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<pebble_mail::SyncProgress>();
+        let (message_tx, mut message_rx) = mpsc::unbounded_channel::<pebble_mail::StoredMessage>();
         let broadcast = self.ws_broadcast.clone();
         let account_id = account.id.clone();
         let provider = account.provider.clone();

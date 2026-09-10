@@ -23,8 +23,9 @@ impl Config {
             .map_err(|_| "PEBBLE_JWT_SECRET env var is required".to_string())?;
 
         if is_insecure_jwt_secret(&jwt_secret) {
-            return Err("PEBBLE_JWT_SECRET must be at least 32 chars and not a placeholder"
-                .to_string());
+            return Err(
+                "PEBBLE_JWT_SECRET must be at least 32 chars and not a placeholder".to_string(),
+            );
         }
         if is_insecure_default_password(&password) {
             return Err("PEBBLE_PASSWORD must be changed from the default value".to_string());

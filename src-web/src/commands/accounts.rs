@@ -123,9 +123,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn serialize_account_credentials(
-    credentials: &AccountCredentials,
-) -> Result<Vec<u8>, PebbleError> {
+fn serialize_account_credentials(credentials: &AccountCredentials) -> Result<Vec<u8>, PebbleError> {
     serde_json::to_vec(credentials)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize config: {e}")))
 }
@@ -246,8 +244,9 @@ fn get_account_proxy_setting_value(
             "Use the OAuth account proxy commands for Gmail and Outlook accounts".to_string(),
         )));
     }
-    let Some(bytes) = encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)
-        .map_err(ApiError::from_pebble)?
+    let Some(bytes) =
+        encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)
+            .map_err(ApiError::from_pebble)?
     else {
         return Ok(AccountProxySetting {
             mode: AccountProxyMode::Inherit,
@@ -331,13 +330,13 @@ fn update_account_proxy_setting_value(
         )));
     }
 
-    let Some(bytes) = encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)
-        .map_err(ApiError::from_pebble)?
+    let Some(bytes) =
+        encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)
+            .map_err(ApiError::from_pebble)?
     else {
-        return Err(PebbleError::Internal(format!(
-            "No auth data found for account {account_id}"
-        ))
-        .into());
+        return Err(
+            PebbleError::Internal(format!("No auth data found for account {account_id}")).into(),
+        );
     };
     let mut credentials = deserialize_account_credentials(&bytes)?;
     set_account_proxy_setting_on_credentials(&mut credentials, setting);
@@ -396,7 +395,10 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
         id: new_id(),
         email: request.email.clone(),
         display_name: request.display_name.clone(),
-        color: Some(crate::account_colors::default_account_color(&existing_accounts, &request.email)),
+        color: Some(crate::account_colors::default_account_color(
+            &existing_accounts,
+            &request.email,
+        )),
         provider: provider.clone(),
         created_at: now,
         updated_at: now,
@@ -547,34 +549,37 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
         .ok_or_else(|| PebbleError::Internal(format!("Account not found: {}", req.account_id)))?;
 
     // 解析现有凭据；缺失时（首次编辑或 OAuth 旧账户）以空模板开始（与桌面端一致）
-    let mut creds =
-        match encrypted_store::load_account_auth_data(&state.crypto, &state.store, &req.account_id)? {
-            Some(bytes) => deserialize_account_credentials(&bytes)?,
-            None => AccountCredentials {
-                proxy_mode: AccountProxyMode::Inherit,
-                imap: StoredMailConfig {
-                    host: String::new(),
-                    port: 0,
-                    username: String::new(),
-                    password: String::new(),
-                    security: None,
-                    use_tls: None,
-                    accept_invalid_certs: false,
-                    proxy: None,
-                },
-                smtp: StoredMailConfig {
-                    host: String::new(),
-                    port: 0,
-                    username: String::new(),
-                    password: String::new(),
-                    security: None,
-                    use_tls: None,
-                    accept_invalid_certs: false,
-                    proxy: None,
-                },
-                allow_plaintext: false,
+    let mut creds = match encrypted_store::load_account_auth_data(
+        &state.crypto,
+        &state.store,
+        &req.account_id,
+    )? {
+        Some(bytes) => deserialize_account_credentials(&bytes)?,
+        None => AccountCredentials {
+            proxy_mode: AccountProxyMode::Inherit,
+            imap: StoredMailConfig {
+                host: String::new(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                security: None,
+                use_tls: None,
+                accept_invalid_certs: false,
+                proxy: None,
             },
-        };
+            smtp: StoredMailConfig {
+                host: String::new(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                security: None,
+                use_tls: None,
+                accept_invalid_certs: false,
+                proxy: None,
+            },
+            allow_plaintext: false,
+        },
+    };
 
     let updated_proxy = if req.proxy_host.is_some() || req.proxy_port.is_some() {
         Some(

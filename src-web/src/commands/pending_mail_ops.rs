@@ -12,8 +12,7 @@ use tracing::{debug, warn};
 use super::compose::{self, LocalOutgoingState};
 use super::messages::{
     classify_remote_delete_result, connect_gmail, connect_imap, connect_outlook,
-    find_folder_by_role, find_message_folder, refresh_search_document,
-    remove_search_documents,
+    find_folder_by_role, find_message_folder, refresh_search_document, remove_search_documents,
 };
 
 const WORKER_INTERVAL_SECS: u64 = 30;
@@ -62,8 +61,9 @@ pub async fn get_pending_mail_ops_summary(
         #[serde(default)]
         account_id: Option<String>,
     }
-    let args: Args = serde_json::from_value(args)
-        .map_err(|e| ApiError::BadRequest(format!("invalid get_pending_mail_ops_summary args: {e}")))?;
+    let args: Args = serde_json::from_value(args).map_err(|e| {
+        ApiError::BadRequest(format!("invalid get_pending_mail_ops_summary args: {e}"))
+    })?;
     let s = state
         .store
         .pending_mail_ops_summary(args.account_id.as_deref())
@@ -136,7 +136,6 @@ pub async fn dismiss_failed_pending_mail_ops(
     }
     Ok(json!(dismissed))
 }
-
 
 pub async fn run_pending_mail_ops_worker(state: AppStateRef) {
     let mut interval =
@@ -246,10 +245,13 @@ fn is_permanent_error(e: &PebbleError) -> bool {
 }
 
 fn emit_pending_ops_changed(state: &crate::state::AppState) {
-    let _ = state.ws_broadcast.send(serde_json::json!({
-        "type": crate::events::MAIL_PENDING_OPS_CHANGED,
-        "payload": serde_json::Value::Null,
-    }).to_string());
+    let _ = state.ws_broadcast.send(
+        serde_json::json!({
+            "type": crate::events::MAIL_PENDING_OPS_CHANGED,
+            "payload": serde_json::Value::Null,
+        })
+        .to_string(),
+    );
 }
 
 async fn replay_pending_mail_op(

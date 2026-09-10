@@ -21,7 +21,10 @@ impl CommandError {
     /// 阶段四命令迁移启用。
     #[allow(dead_code)]
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self { code: "INVALID_ARGUMENT", message: message.into() }
+        Self {
+            code: "INVALID_ARGUMENT",
+            message: message.into(),
+        }
     }
 }
 
@@ -119,6 +122,10 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", msg),
         };
-        (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+        (
+            status,
+            Json(json!({ "error": { "code": code, "message": message } })),
+        )
+            .into_response()
     }
 }

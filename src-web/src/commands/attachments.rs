@@ -545,11 +545,9 @@ pub async fn download_attachment(
         ));
     }
 
-    let file = tokio::fs::File::open(&canonical_path)
-        .await
-        .map_err(|e| {
-            ApiError::from_pebble(PebbleError::Internal(format!("Failed to open source: {e}")))
-        })?;
+    let file = tokio::fs::File::open(&canonical_path).await.map_err(|e| {
+        ApiError::from_pebble(PebbleError::Internal(format!("Failed to open source: {e}")))
+    })?;
     let actual_size = file
         .metadata()
         .await
@@ -565,7 +563,7 @@ pub async fn download_attachment(
     let mime = attachment.mime_type.clone();
     let disposition = content_disposition_attachment(&attachment.filename);
 
-    Ok(Response::builder()
+    Response::builder()
         .header(
             header::CONTENT_TYPE,
             if mime.is_empty() {
@@ -577,25 +575,34 @@ pub async fn download_attachment(
         .header(header::CONTENT_DISPOSITION, disposition)
         .header(header::CONTENT_LENGTH, actual_size.to_string())
         .body(body)
-        .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))?)
+        .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))
 }
 
 fn content_disposition_attachment(name: &str) -> String {
     let safe_name = name.replace(['"', '\r', '\n'], "_");
     let ascii_fallback = safe_name
         .chars()
-        .map(|ch| if ch.is_ascii() && !ch.is_ascii_control() { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_ascii_control() {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
     let encoded = percent_encode_header_value(safe_name.as_bytes());
-    format!(
-        "attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
-    )
+    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 fn percent_encode_header_value(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len());
     for &byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
             encoded.push(byte as char);
         } else {
             use std::fmt::Write as _;

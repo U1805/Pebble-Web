@@ -1,8 +1,18 @@
-use axum::{body::Bytes, extract::{Path, State}, http::HeaderMap, Json};
+use axum::{
+    body::Bytes,
+    extract::{Path, State},
+    http::HeaderMap,
+    Json,
+};
 use serde_json::{json, Value};
 
 use crate::auth;
-use crate::commands::{accounts, advanced_search, appearance, attachments, batch, cloud_sync, compose, contacts, diagnostics, drafts, folder_counts, folders, health, kanban, labels, messages, network, oauth, pending_mail_ops, rules, search, snooze, sync_cmd, threads, translate, trusted_senders, user_data};
+use crate::commands::{
+    accounts, advanced_search, appearance, attachments, batch, cloud_sync, compose, contacts,
+    diagnostics, drafts, folder_counts, folders, health, kanban, labels, messages, network, oauth,
+    pending_mail_ops, rules, search, snooze, sync_cmd, threads, translate, trusted_senders,
+    user_data,
+};
 use crate::error::ApiError;
 use crate::state::AppStateRef;
 
@@ -193,15 +203,13 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
         "delete_background_image" => Ok(Json(
             appearance::delete_background_image(state, args).await?,
         )),
-        "get_oauth_account_proxy" => Ok(Json(
-            oauth::get_oauth_account_proxy(state, args).await?,
-        )),
+        "get_oauth_account_proxy" => Ok(Json(oauth::get_oauth_account_proxy(state, args).await?)),
         "get_oauth_account_proxy_setting" => Ok(Json(
             oauth::get_oauth_account_proxy_setting(state, args).await?,
         )),
-        "update_oauth_account_proxy" => Ok(Json(
-            oauth::update_oauth_account_proxy(state, args).await?,
-        )),
+        "update_oauth_account_proxy" => {
+            Ok(Json(oauth::update_oauth_account_proxy(state, args).await?))
+        }
         "update_oauth_account_proxy_setting" => Ok(Json(
             oauth::update_oauth_account_proxy_setting(state, args).await?,
         )),
@@ -209,13 +217,17 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
         "preview_backup_file" => Ok(Json(cloud_sync::preview_backup_file(state, args).await?)),
         "import_backup_file" => Ok(Json(cloud_sync::import_backup_file(state, args).await?)),
         // WebDAV 云端同步（Web 后端真实实现，能力对齐桌面端）
-        "test_webdav_connection" => Ok(Json(cloud_sync::test_webdav_connection(state, args).await?)),
+        "test_webdav_connection" => {
+            Ok(Json(cloud_sync::test_webdav_connection(state, args).await?))
+        }
         "backup_to_webdav" => Ok(Json(cloud_sync::backup_to_webdav(state, args).await?)),
         "preview_webdav_backup" => Ok(Json(cloud_sync::preview_webdav_backup(state, args).await?)),
         "restore_from_webdav" => Ok(Json(cloud_sync::restore_from_webdav(state, args).await?)),
         "save_auto_backup_config" => Ok(Json(cloud_sync::save_auto_backup_config(state, args)?)),
         "load_auto_backup_config" => Ok(Json(cloud_sync::load_auto_backup_config(state, args)?)),
-        "delete_auto_backup_config" => Ok(Json(cloud_sync::delete_auto_backup_config(state, args)?)),
+        "delete_auto_backup_config" => {
+            Ok(Json(cloud_sync::delete_auto_backup_config(state, args)?))
+        }
         // 全局网络代理（Web 端真实实现，作用于后端 IMAP/SMTP/连接测试装配）
         "get_global_proxy" => Ok(Json(network::get_global_proxy(state, args).await?)),
         "update_global_proxy" => Ok(Json(network::update_global_proxy(state, args).await?)),
@@ -227,9 +239,9 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
             attachments::cleanup_staged_compose_attachment(state, args).await?,
         )),
         "get_attachment_path" => Ok(Json(attachments::get_attachment_path(state, args).await?)),
-        "save_draft" | "delete_draft" => Ok(Json(
-            drafts::dispatch_command(state, command, args).await?,
-        )),
+        "save_draft" | "delete_draft" => {
+            Ok(Json(drafts::dispatch_command(state, command, args).await?))
+        }
         "list_email_templates" => Ok(Json(user_data::list_email_templates(state, args).await?)),
         "save_email_template" => Ok(Json(user_data::save_email_template(state, args).await?)),
         "delete_email_template" => Ok(Json(user_data::delete_email_template(state, args).await?)),
@@ -239,9 +251,9 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
             user_data::migrate_email_signature_if_absent(state, args).await?,
         )),
         "list_folders" => Ok(Json(folders::list_folders(state, args).await?)),
-        "get_folder_unread_counts" => {
-            Ok(Json(folder_counts::get_folder_unread_counts(state, args).await?))
-        }
+        "get_folder_unread_counts" => Ok(Json(
+            folder_counts::get_folder_unread_counts(state, args).await?,
+        )),
         "get_imap_sync_folders" => Ok(Json(folders::get_imap_sync_folders(state, args).await?)),
         "update_imap_sync_folders" => {
             Ok(Json(folders::update_imap_sync_folders(state, args).await?))
@@ -312,27 +324,24 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
         // 连接测试（A 方案：Web 端真实可用，UI 与桌面同步）
         "test_imap_connection" => Ok(Json(accounts::test_imap_connection(state, args).await?)),
         "test_pop3_connection" => Ok(Json(accounts::test_pop3_connection(state, args).await?)),
-        "test_account_connection" => Ok(Json(
-            accounts::test_account_connection(state, args).await?,
-        )),
+        "test_account_connection" => {
+            Ok(Json(accounts::test_account_connection(state, args).await?))
+        }
         // 诊断日志（A 方案：日志文件化，Web 端可读服务端日志）
         "read_app_log" => Ok(Json(diagnostics::read_app_log(state, args).await?)),
         // 更新检查（Web 端指向上游 fork Release，真实可用）
         "check_for_update" => Ok(Json(health::check_for_update(state, args).await?)),
         // 消息生命周期（本地提交 + 远端排队）
-        "archive_message"
-        | "restore_message"
-        | "delete_message"
-        | "move_to_folder"
+        "archive_message" | "restore_message" | "delete_message" | "move_to_folder"
         | "empty_trash" => Ok(Json(
             messages::lifecycle::dispatch_command(state, command, args).await?,
         )),
         "update_message_flags" => Ok(Json(
             messages::flags::dispatch_command(state, command, args).await?,
         )),
-        "batch_archive" | "batch_delete" | "batch_mark_read" | "batch_star" => Ok(Json(
-            batch::dispatch_command(state, command, args).await?,
-        )),
+        "batch_archive" | "batch_delete" | "batch_mark_read" | "batch_star" => {
+            Ok(Json(batch::dispatch_command(state, command, args).await?))
+        }
         // 同步（4.6）与待处理队列
         "trigger_sync" => Ok(Json(sync_cmd::trigger_sync(state, args).await?)),
         "start_sync" => Ok(Json(sync_cmd::start_sync(state, args).await?)),
@@ -344,7 +353,9 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
         "get_pending_mail_ops_summary" => Ok(Json(
             pending_mail_ops::get_pending_mail_ops_summary(state, args).await?,
         )),
-        "list_pending_mail_ops" => Ok(Json(pending_mail_ops::list_pending_mail_ops(state, args).await?)),
+        "list_pending_mail_ops" => Ok(Json(
+            pending_mail_ops::list_pending_mail_ops(state, args).await?,
+        )),
         "dismiss_failed_pending_mail_ops" => Ok(Json(
             pending_mail_ops::dismiss_failed_pending_mail_ops(state, args).await?,
         )),

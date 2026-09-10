@@ -8,12 +8,12 @@ use pebble_mail::smtp::SmtpSender;
 use pebble_mail::{GmailProvider, OutlookProvider, SmtpConfig};
 use serde_json::Value;
 
+use crate::blocking::{run_blocking, run_blocking_core};
 use crate::commands::accounts::StoredMailConfig;
 use crate::commands::attachments::{
     cleanup_local_attachment_records, stage_local_attachment_records,
     validate_staged_attachment_paths,
 };
-use crate::blocking::{run_blocking, run_blocking_core};
 use crate::commands::encrypted_store;
 use crate::error::ApiError;
 use crate::events;
@@ -82,11 +82,15 @@ fn parse_recipients(addresses: Vec<String>) -> Vec<EmailAddress> {
 
 /// 读取账户 SMTP 配置（auth_data 解密）。
 /// 加载账户 SMTP 配置并按代理模式解析生效代理（Inherit→账户或全局代理）。
-pub(crate) fn load_smtp_config(state: &AppState, account_id: &str) -> Result<SmtpConfig, PebbleError> {
-    let decrypted = encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)?
-        .ok_or_else(|| {
-            PebbleError::Internal(format!("No auth data found for account {account_id}"))
-        })?;
+pub(crate) fn load_smtp_config(
+    state: &AppState,
+    account_id: &str,
+) -> Result<SmtpConfig, PebbleError> {
+    let decrypted =
+        encrypted_store::load_account_auth_data(&state.crypto, &state.store, account_id)?
+            .ok_or_else(|| {
+                PebbleError::Internal(format!("No auth data found for account {account_id}"))
+            })?;
     let config: serde_json::Value = serde_json::from_slice(&decrypted)
         .map_err(|e| PebbleError::Internal(format!("Failed to parse decrypted config: {e}")))?;
     let stored: StoredMailConfig = serde_json::from_value(
@@ -122,12 +126,7 @@ fn prepare_outgoing_send_locally(
     let sent_folder_id = if delete_placeholder_after_send {
         None
     } else {
-        Some(ensure_local_outgoing_folder(
-            &state.store,
-            &account.id,
-            LocalOutgoingState::Sent,
-        )?
-        .id)
+        Some(ensure_local_outgoing_folder(&state.store, &account.id, LocalOutgoingState::Sent)?.id)
     };
 
     let now = now_timestamp();

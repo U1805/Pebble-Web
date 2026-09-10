@@ -12,8 +12,6 @@ use pebble_store::Store;
 use serde_json::json;
 use tracing::{info, warn};
 
-
-
 /// Replay crash-recovery search operations before long-lived mail workers
 /// start. Markers are only cleared after a successful Tantivy commit.
 pub(crate) fn recover_pending_search_operations(
@@ -318,10 +316,7 @@ fn queue_remote_rule_action(
                 payload["remove_labels"] = json!(["INBOX"]);
             }
             crate::commands::pending_mail_ops::queue_pending_for_store(
-                store,
-                &message,
-                "archive",
-                payload,
+                store, &message, "archive", payload,
             )?;
             Ok(true)
         }

@@ -60,7 +60,9 @@ pub async fn list_folders(state: AppStateRef, args: Value) -> Result<Value, ApiE
         let folders = store.list_folders(&account_id)?;
 
         if !provider_folders_have_arrived(&folders) {
-            return Ok(crate::patch::folders::local_mail_folders_before_sync(folders));
+            return Ok(crate::patch::folders::local_mail_folders_before_sync(
+                folders,
+            ));
         }
 
         if should_seed_local_archive(&folders) {

@@ -4,10 +4,10 @@
 
 pub mod account_colors;
 pub mod auth;
-pub(crate) mod browser_notifications;
 pub(crate) mod blocking;
-pub mod commands;
+pub(crate) mod browser_notifications;
 pub mod command_router;
+pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod error;
@@ -16,10 +16,10 @@ pub(crate) mod oauth;
 #[path = "../patch/mod.rs"]
 pub(crate) mod patch;
 pub mod profile;
-pub mod state;
-pub mod snooze_watcher;
-pub mod sync_runtime;
 pub mod realtime;
+pub mod snooze_watcher;
+pub mod state;
+pub mod sync_runtime;
 
 use axum::{extract::DefaultBodyLimit, routing::post, Router};
 use tower_http::services::{ServeDir, ServeFile};

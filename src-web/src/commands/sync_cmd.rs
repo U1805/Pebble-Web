@@ -48,7 +48,10 @@ pub async fn start_sync(state: AppStateRef, args: Value) -> Result<Value, ApiErr
         .start_account(args.account_id.clone(), args.poll_interval_secs)
         .await
         .map_err(ApiError::from_pebble)?;
-    Ok(json!(format!("Sync started for account {}", args.account_id)))
+    Ok(json!(format!(
+        "Sync started for account {}",
+        args.account_id
+    )))
 }
 
 /// Stop and remove the account's long-lived sync worker.

@@ -83,7 +83,9 @@ pub async fn restore_from_webdav(state: AppStateRef, args: Value) -> Result<Valu
 
 // ─── 自动备份配置（secure_user_data，与桌面端同 key） ───────────────
 
-fn auto_backup_interval_duration(interval_minutes: u64) -> Result<std::time::Duration, PebbleError> {
+fn auto_backup_interval_duration(
+    interval_minutes: u64,
+) -> Result<std::time::Duration, PebbleError> {
     if !SUPPORTED_INTERVALS_MINUTES.contains(&interval_minutes) {
         return Err(PebbleError::Internal(format!(
             "Unsupported auto-backup interval: {interval_minutes} minutes"
@@ -121,12 +123,12 @@ fn load_config(state: &AppStateRef) -> Result<Option<AutoBackupConfig>, PebbleEr
         &state.crypto,
         &state.store,
         AUTO_BACKUP_CONFIG_KEY,
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
-    let config: AutoBackupConfig = serde_json::from_slice(&plaintext).map_err(|e| {
-        PebbleError::Internal(format!("Failed to deserialize config: {e}"))
-    })?;
+    let config: AutoBackupConfig = serde_json::from_slice(&plaintext)
+        .map_err(|e| PebbleError::Internal(format!("Failed to deserialize config: {e}")))?;
     validate_interval(config.interval_minutes)?;
     Ok(Some(config))
 }

@@ -1346,29 +1346,48 @@ pub async fn dispatch_command(
     match command {
         "archive_message" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_id: String }
-            let args: Args = serde_json::from_value(args).map_err(invalid_args("archive_message"))?;
-            let result = archive_message(state, args.message_id).await.map_err(ApiError::from_pebble)?;
+            struct Args {
+                message_id: String,
+            }
+            let args: Args =
+                serde_json::from_value(args).map_err(invalid_args("archive_message"))?;
+            let result = archive_message(state, args.message_id)
+                .await
+                .map_err(ApiError::from_pebble)?;
             Ok(serde_json::json!(result))
         }
         "restore_message" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_id: String }
-            let args: Args = serde_json::from_value(args).map_err(invalid_args("restore_message"))?;
-            restore_message(state, args.message_id).await.map_err(ApiError::from_pebble)?;
+            struct Args {
+                message_id: String,
+            }
+            let args: Args =
+                serde_json::from_value(args).map_err(invalid_args("restore_message"))?;
+            restore_message(state, args.message_id)
+                .await
+                .map_err(ApiError::from_pebble)?;
             Ok(serde_json::Value::Null)
         }
         "delete_message" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_id: String }
-            let args: Args = serde_json::from_value(args).map_err(invalid_args("delete_message"))?;
-            delete_message(state, args.message_id).await.map_err(ApiError::from_pebble)?;
+            struct Args {
+                message_id: String,
+            }
+            let args: Args =
+                serde_json::from_value(args).map_err(invalid_args("delete_message"))?;
+            delete_message(state, args.message_id)
+                .await
+                .map_err(ApiError::from_pebble)?;
             Ok(serde_json::Value::Null)
         }
         "move_to_folder" => {
             #[derive(serde::Deserialize)]
-            struct Args { message_id: String, target_folder_id: String }
-            let args: Args = serde_json::from_value(args).map_err(invalid_args("move_to_folder"))?;
+            struct Args {
+                message_id: String,
+                target_folder_id: String,
+            }
+            let args: Args =
+                serde_json::from_value(args).map_err(invalid_args("move_to_folder"))?;
             move_to_folder(state, args.message_id, args.target_folder_id)
                 .await
                 .map_err(ApiError::from_pebble)?;
@@ -1376,9 +1395,13 @@ pub async fn dispatch_command(
         }
         "empty_trash" => {
             #[derive(serde::Deserialize)]
-            struct Args { account_id: String }
+            struct Args {
+                account_id: String,
+            }
             let args: Args = serde_json::from_value(args).map_err(invalid_args("empty_trash"))?;
-            let count = empty_trash(state, args.account_id).await.map_err(ApiError::from_pebble)?;
+            let count = empty_trash(state, args.account_id)
+                .await
+                .map_err(ApiError::from_pebble)?;
             Ok(serde_json::json!(count))
         }
         _ => Err(ApiError::NotFound(format!("unknown command: {command}"))),

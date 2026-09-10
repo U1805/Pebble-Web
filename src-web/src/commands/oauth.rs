@@ -1,6 +1,4 @@
-use pebble_core::{
-    now_timestamp, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType,
-};
+use pebble_core::{now_timestamp, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType};
 use pebble_crypto::CryptoService;
 use pebble_mail::gmail_sync::TokenRefresher;
 use pebble_oauth::{OAuthConfig, OAuthManager, OAuthNetworkConfig};
@@ -13,7 +11,8 @@ use crate::blocking::run_blocking;
 use crate::commands::encrypted_store::{load_account_auth_data, store_account_auth_data};
 use crate::commands::network::{
     account_proxy_setting_from_parts, get_global_proxy_raw, normalize_account_proxy_setting,
-    proxy_config_from_parts, resolve_effective_proxy_setting, AccountProxyMode, AccountProxySetting,
+    proxy_config_from_parts, resolve_effective_proxy_setting, AccountProxyMode,
+    AccountProxySetting,
 };
 use crate::error::ApiError;
 use crate::state::{AppState, AppStateRef, OAuthAccountLockRegistry};
@@ -63,15 +62,15 @@ fn provider_slug(provider: &ProviderType) -> &'static str {
     }
 }
 
-fn ensure_oauth_account_provider(
-    state: &AppState,
-    account_id: &str,
-) -> Result<(), PebbleError> {
+fn ensure_oauth_account_provider(state: &AppState, account_id: &str) -> Result<(), PebbleError> {
     let account = state
         .store
         .get_account(account_id)?
         .ok_or_else(|| PebbleError::Internal(format!("Account not found: {account_id}")))?;
-    if matches!(account.provider, ProviderType::Gmail | ProviderType::Outlook) {
+    if matches!(
+        account.provider,
+        ProviderType::Gmail | ProviderType::Outlook
+    ) {
         Ok(())
     } else {
         Err(PebbleError::UnsupportedProvider(
@@ -157,7 +156,10 @@ pub(crate) struct StoredOAuthAuthData {
     expires_at: Option<i64>,
     #[serde(default)]
     scopes: Vec<String>,
-    #[serde(default, skip_serializing_if = "crate::commands::network::is_inherit_proxy_mode")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::commands::network::is_inherit_proxy_mode"
+    )]
     proxy_mode: AccountProxyMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy: Option<HttpProxyConfig>,
@@ -402,8 +404,7 @@ fn update_oauth_account_proxy_setting_raw(
     proxy_port: Option<u16>,
 ) -> Result<(), PebbleError> {
     ensure_oauth_account_provider(state, account_id)?;
-    let setting =
-        account_proxy_setting_from_parts(mode, proxy_host, proxy_port, "OAuth proxy")?;
+    let setting = account_proxy_setting_from_parts(mode, proxy_host, proxy_port, "OAuth proxy")?;
     let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, account_id)?
         .ok_or_else(|| {
             PebbleError::Internal(format!("No auth data found for account {account_id}"))
@@ -416,7 +417,8 @@ pub async fn get_oauth_account_proxy(state: AppStateRef, args: Value) -> Result<
     let args: AccountProxyArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("invalid get_oauth_account_proxy args: {e}")))?;
     let account_id = args.account_id;
-    let setting = run_blocking(move || get_oauth_account_proxy_setting_raw(&state, &account_id)).await?;
+    let setting =
+        run_blocking(move || get_oauth_account_proxy_setting_raw(&state, &account_id)).await?;
     serde_json::to_value(setting.proxy).map_err(ApiError::from_serialize)
 }
 
@@ -428,7 +430,8 @@ pub async fn get_oauth_account_proxy_setting(
         ApiError::BadRequest(format!("invalid get_oauth_account_proxy_setting args: {e}"))
     })?;
     let account_id = args.account_id;
-    let setting = run_blocking(move || get_oauth_account_proxy_setting_raw(&state, &account_id)).await?;
+    let setting =
+        run_blocking(move || get_oauth_account_proxy_setting_raw(&state, &account_id)).await?;
     serde_json::to_value(setting).map_err(ApiError::from_serialize)
 }
 
@@ -442,21 +445,11 @@ pub async fn update_oauth_account_proxy(
     let proxy = proxy_config_from_parts(args.proxy_host, args.proxy_port, "OAuth proxy")
         .map_err(ApiError::from_pebble)?;
     let (mode, proxy_host, proxy_port) = match proxy {
-        Some(proxy) => (
-            AccountProxyMode::Custom,
-            Some(proxy.host),
-            Some(proxy.port),
-        ),
+        Some(proxy) => (AccountProxyMode::Custom, Some(proxy.host), Some(proxy.port)),
         None => (AccountProxyMode::Inherit, None, None),
     };
-    update_oauth_account_proxy_setting_value(
-        state,
-        args.account_id,
-        mode,
-        proxy_host,
-        proxy_port,
-    )
-    .await?;
+    update_oauth_account_proxy_setting_value(state, args.account_id, mode, proxy_host, proxy_port)
+        .await?;
     Ok(Value::Null)
 }
 
@@ -487,17 +480,10 @@ async fn update_oauth_account_proxy_setting_value(
     proxy_host: Option<String>,
     proxy_port: Option<u16>,
 ) -> Result<(), ApiError> {
-    let account_lock =
-        oauth_account_lock(&state.oauth_account_locks, &account_id).await;
+    let account_lock = oauth_account_lock(&state.oauth_account_locks, &account_id).await;
     let _account_guard = account_lock.lock().await;
     run_blocking(move || {
-        update_oauth_account_proxy_setting_raw(
-            &state,
-            &account_id,
-            mode,
-            proxy_host,
-            proxy_port,
-        )
+        update_oauth_account_proxy_setting_raw(&state, &account_id, mode, proxy_host, proxy_port)
     })
     .await
 }
