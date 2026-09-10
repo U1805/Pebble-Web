@@ -46,7 +46,8 @@ Web 不实现对应桌面行为。
 | 功能 | Tauri 命令或能力 | Web 行为 |
 |---|---|---|
 | 开机启动 | `get_autostart_enabled` | 返回浏览器平台不可用状态 |
-| 设置开机启动 | `set_autostart_enabled` | 明确报告浏览器不支持 |
+| 设置开机启动 | `set_autostart_enabled` | command 拒绝操作，页面恢复开关状态并提示“更新失败” |
+| 启动后隐藏到托盘、关闭窗口行为 | 上游前端本地偏好及 Tauri window API | Web 将本地 setter 接入 `invoke`，由 Web shim 命令 `set_start_hidden_to_tray` / `set_keep_running_in_background` 拒绝操作；不保存偏好，统一提示“更新失败”，同样覆盖状态栏按钮。这两个命令仅用于 Web 适配，并非上游已注册的 Tauri 命令 |
 | 托盘菜单文案 | `set_tray_menu_labels` | 浏览器无托盘，不执行桌面操作 |
 | 启动时 mailto 队列 | `take_pending_mailto_urls` | 浏览器不维护桌面 mailto 启动队列 |
 | 默认邮件客户端设置 | `open_default_mail_settings` | 浏览器不能修改操作系统默认邮件客户端 |
@@ -58,6 +59,7 @@ Web 不实现对应桌面行为。
 
 ```text
 src-web/frontend/runtime/desktop.ts
+src-web/frontend/runtime/desktop-preferences.ts
 src-web/frontend/tauri/window.ts
 ```
 

@@ -14,6 +14,13 @@ const DESKTOP_ONLY_COMMANDS: Record<string, DesktopCommandHandler> = {
   set_autostart_enabled: () => {
     throw new Error("Launch at startup is only available in the desktop app");
   },
+  // Web adapter commands for preferences that upstream stores locally.
+  set_start_hidden_to_tray: () => {
+    throw new Error("Start hidden to tray is only available in the desktop app");
+  },
+  set_keep_running_in_background: () => {
+    throw new Error("Close behavior is only available in the desktop app");
+  },
   set_tray_menu_labels: () => undefined,
   take_pending_mailto_urls: () => [],
   open_default_mail_settings: () => {

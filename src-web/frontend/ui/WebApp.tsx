@@ -3,8 +3,10 @@ import { useEffect } from "react";
 import { logStartupTiming } from "@/lib/startupTiming";
 import AuthGate from "./AuthGate";
 import { useWebNotifications } from "./Notifications";
+import { initializeWebDesktopPreferences } from "../runtime/desktop-preferences";
 import "./web.css";
 
+initializeWebDesktopPreferences();
 document.documentElement.dataset.pebblePlatform = "web";
 
 function AuthenticatedApp() {
