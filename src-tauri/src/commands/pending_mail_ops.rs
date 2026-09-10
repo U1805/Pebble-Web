@@ -1,6 +1,6 @@
 use crate::commands::attachments::cleanup_staged_attachment_records;
 use crate::{events, state::AppState};
-use pebble_core::traits::{FolderProvider, LabelProvider, MailTransport};
+use pebble_core::traits::{FolderProvider, LabelProvider};
 use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
 use pebble_store::pending_ops::{PendingMailOp, PendingMailOpsSummary};
 use pebble_store::Store;
@@ -178,6 +178,12 @@ pub async fn process_pending_mail_ops(
                     .mark_pending_mail_op_failed(&op.id, &e.to_string())?;
                 warn!("Pending mail op {} retry failed: {e}", op.id);
             }
+            Err(ReplayPendingMailOpError::SenderIdentityBlocked(e)) => {
+                state.store.mark_pending_mail_op_stopped(
+                    &op.id,
+                    &format!("Sender identity requires attention; no message was sent. {e}"),
+                )?;
+            }
         }
     }
 
@@ -189,6 +195,7 @@ pub async fn process_pending_mail_ops(
 
 #[derive(Debug)]
 enum ReplayPendingMailOpError {
+    SenderIdentityBlocked(PebbleError),
     Retryable(PebbleError),
     RemoteSendOutcomeUnknown(PebbleError),
 }
@@ -608,7 +615,7 @@ async fn replay_remote_move_to_folder(
 
 async fn replay_remote_send(
     state: &AppState,
-    provider_type: ProviderType,
+    _provider_type: ProviderType,
     account: &pebble_core::Account,
     message: &pebble_core::Message,
 ) -> std::result::Result<(), ReplayPendingMailOpError> {
@@ -619,20 +626,40 @@ async fn replay_remote_send(
         .filter_map(|attachment| attachment.local_path)
         .collect::<Vec<_>>();
     let outgoing = compose::outgoing_message_from_stored(message, attachment_paths);
+    pebble_mail::sender::sender_mailbox(&outgoing.from)
+        .map_err(ReplayPendingMailOpError::SenderIdentityBlocked)?;
+    // Preparation errors are pre-dispatch and must never become outcome-unknown.
+    let (transport, verified_from) = compose::prepare_send_transport(state, account)
+        .await
+        .map_err(|error| {
+            if matches!(error, PebbleError::Validation(_)) {
+                ReplayPendingMailOpError::SenderIdentityBlocked(error)
+            } else {
+                ReplayPendingMailOpError::Retryable(error)
+            }
+        })?;
+    replay_prepared_send(&outgoing, &verified_from, || transport.send(&outgoing)).await
+}
 
-    match provider_type {
-        ProviderType::Gmail => {
-            let provider = connect_gmail(state, &account.id).await?;
-            classify_remote_send_call(provider.send_message(&outgoing).await)
-        }
-        ProviderType::Outlook => {
-            let provider = connect_outlook(state, &account.id).await?;
-            classify_remote_send_call(provider.send_message(&outgoing).await)
-        }
-        ProviderType::Imap | ProviderType::Pop3 => classify_remote_send_call(
-            compose::send_imap_smtp_message(state, account, &outgoing).await,
-        ),
+async fn replay_prepared_send<F, Fut>(
+    outgoing: &pebble_core::traits::OutgoingMessage,
+    verified_from: &pebble_core::EmailAddress,
+    send: F,
+) -> std::result::Result<(), ReplayPendingMailOpError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), PebbleError>>,
+{
+    if !outgoing
+        .from
+        .address
+        .eq_ignore_ascii_case(&verified_from.address)
+    {
+        return Err(ReplayPendingMailOpError::SenderIdentityBlocked(PebbleError::Validation(
+            "The queued message belongs to a different mailbox. Review it and compose a new message if needed.".into(),
+        )));
     }
+    classify_remote_send_call(send().await)
 }
 
 fn apply_pending_local_commit(
@@ -849,9 +876,63 @@ mod tests {
     use pebble_core::*;
     use pebble_store::Store;
 
+    #[tokio::test]
+    async fn queued_send_stops_before_dispatch_after_mailbox_address_changes() {
+        for provider in [ProviderType::Imap, ProviderType::Pop3] {
+            let store = Store::open_in_memory().unwrap();
+            let mut account = test_account();
+            account.provider = provider;
+            store.insert_account(&account).unwrap();
+            let mut message = test_message(&account.id);
+            message.from_address = account.email.clone();
+            message.from_name = "Original sender".into();
+            store.insert_message(&message, &[]).unwrap();
+            store
+                .update_account_details(&account.id, "other@example.com", "New sender", None, None)
+                .unwrap();
+            let changed = store.get_account(&account.id).unwrap().unwrap();
+            let stored = store.get_message(&message.id).unwrap().unwrap();
+            let outgoing = compose::outgoing_message_from_stored(&stored, vec![]);
+            let calls = std::cell::Cell::new(0);
+            let result =
+                super::replay_prepared_send(&outgoing, &changed.sender_identity(), || async {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(ReplayPendingMailOpError::SenderIdentityBlocked(_))
+            ));
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_send_keeps_original_name_when_only_name_changes() {
+        let mut account = test_account();
+        account.provider = ProviderType::Imap;
+        let mut message = test_message(&account.id);
+        message.from_address = account.email.to_uppercase();
+        message.from_name = "Original sender".into();
+        account.display_name = "New sender".into();
+        let outgoing = compose::outgoing_message_from_stored(&message, vec![]);
+        let calls = std::cell::Cell::new(0);
+        super::replay_prepared_send(&outgoing, &account.sender_identity(), || async {
+            calls.set(calls.get() + 1);
+            assert_eq!(outgoing.from.name.as_deref(), Some("Original sender"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
     fn test_account() -> Account {
         let now = now_timestamp();
         Account {
+            account_label: None,
+            provider_display_name: None,
             id: new_id(),
             email: "test@example.com".to_string(),
             display_name: "Test".to_string(),
