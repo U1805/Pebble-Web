@@ -237,7 +237,7 @@ pub(crate) fn restore_backup_data(
         .store
         .import_settings_with_private_data(data, private_data)?;
     Ok(if restored_secrets {
-        "Settings backup restored with account passwords, OAuth tokens, and API keys."
+        "Settings backup restored with saved credentials. Existing OAuth connections and mailboxes with local data were preserved."
     } else {
         "Settings backup restored. Reconnect accounts to continue syncing."
     }

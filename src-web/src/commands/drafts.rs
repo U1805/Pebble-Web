@@ -145,7 +145,14 @@ pub async fn save_draft(
         &account_id,
         existing_draft_id.as_deref(),
     )?;
+    let account = state
+        .store
+        .get_account(&account_id)?
+        .ok_or_else(|| PebbleError::Validation("Account not found".into()))?;
+    let sender = account.sender_identity();
+    pebble_mail::sender::sender_mailbox(&sender)?;
     let draft = DraftMessage {
+        from: Some(sender),
         id: provenance.remote_id.clone(),
         to: to
             .into_iter()
@@ -175,42 +182,64 @@ pub async fn save_draft(
         attachment_paths,
     };
 
-    let provider_type = state.store.get_account(&account_id)?.map(|a| a.provider);
-
-    match provider_type {
-        Some(pt) => {
-            if let Ok(conn) = ConnectedProvider::connect(&state, &account_id, &pt).await {
-                let result = if matches!(pt, ProviderType::Gmail | ProviderType::Outlook) {
-                    save_oauth_draft_with_fallback(&state, &account_id, &draft, &provenance, &conn)
-                        .await
-                } else {
-                    save_draft_locally(
-                        &state,
-                        &account_id,
-                        &draft,
-                        provenance.local_id.as_deref(),
-                        provenance.remote_id.as_deref(),
-                    )
+    if matches!(
+        account.provider,
+        ProviderType::Gmail | ProviderType::Outlook
+    ) {
+        // Reuse the verified connection itself; a second connect could read different credentials.
+        let prepared = super::compose::prepare_send_transport(&state, &account)
+            .await
+            .and_then(|(transport, sender)| {
+                use super::compose::PreparedSendTransport;
+                let remote = match transport {
+                    PreparedSendTransport::Gmail(provider) => ConnectedProvider::Gmail(provider),
+                    PreparedSendTransport::Outlook(provider) => {
+                        ConnectedProvider::Outlook(provider)
+                    }
+                    PreparedSendTransport::Smtp(_) => {
+                        return Err(PebbleError::UnsupportedProvider(
+                            "Remote drafts require OAuth".into(),
+                        ))
+                    }
                 };
-                conn.disconnect().await;
-                result
-            } else {
-                save_draft_locally(
-                    &state,
-                    &account_id,
-                    &draft,
-                    provenance.local_id.as_deref(),
-                    provenance.remote_id.as_deref(),
-                )
-            }
-        }
-        None => save_draft_locally(
+                Ok((remote, sender))
+            });
+        save_prepared_oauth_draft(&state, &account_id, &draft, &provenance, prepared).await
+    } else {
+        save_draft_locally(
             &state,
             &account_id,
             &draft,
             provenance.local_id.as_deref(),
             provenance.remote_id.as_deref(),
-        ),
+        )
+    }
+}
+
+async fn save_prepared_oauth_draft<R: RemoteDraftOperations>(
+    state: &AppState,
+    account_id: &str,
+    draft: &DraftMessage,
+    provenance: &DraftProvenance,
+    prepared: Result<(R, EmailAddress), PebbleError>,
+) -> Result<String, PebbleError> {
+    match prepared {
+        Ok((remote, sender)) => {
+            let mut verified_draft = draft.clone();
+            verified_draft.from = Some(sender);
+            save_oauth_draft_with_fallback(state, account_id, &verified_draft, provenance, &remote)
+                .await
+        }
+        Err(error) => {
+            warn!("Draft identity verification failed; preserving local draft: {error}");
+            save_draft_locally(
+                state,
+                account_id,
+                draft,
+                provenance.local_id.as_deref(),
+                provenance.remote_id.as_deref(),
+            )
+        }
     }
 }
 
@@ -285,8 +314,16 @@ fn save_draft_locally(
         thread_id: None,
         subject: draft.subject.clone(),
         snippet: draft.body_text.chars().take(200).collect(),
-        from_address: String::new(),
-        from_name: String::new(),
+        from_address: draft
+            .from
+            .as_ref()
+            .map(|from| from.address.clone())
+            .unwrap_or_default(),
+        from_name: draft
+            .from
+            .as_ref()
+            .and_then(|from| from.name.clone())
+            .unwrap_or_default(),
         to_list: draft.to.clone(),
         cc_list: draft.cc.clone(),
         bcc_list: draft.bcc.clone(),

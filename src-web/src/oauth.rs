@@ -199,7 +199,7 @@ fn token_response_to_pair(
 /// it before doing any network or storage work (one-time use).
 pub(crate) struct PendingOAuth {
     pub(crate) provider: String,
-    pub(crate) email: String,
+    pub(crate) account_label: Option<String>,
     pub(crate) display_name: String,
     pub(crate) account_proxy: Option<HttpProxyConfig>,
     pub(crate) redirect_url: String,
@@ -212,8 +212,11 @@ pub(crate) struct PendingOAuth {
 #[derive(Deserialize)]
 struct StartOAuthArgs {
     provider: String,
-    email: String,
+    #[serde(rename = "email")]
+    _email: String,
     display_name: String,
+    #[serde(default)]
+    account_label: Option<String>,
     #[serde(default)]
     proxy_host: Option<String>,
     #[serde(default)]
@@ -368,7 +371,7 @@ pub(crate) async fn start_oauth_flow(state: AppStateRef, args: Value) -> Result<
         state_key,
         PendingOAuth {
             provider,
-            email: args.email,
+            account_label: args.account_label,
             display_name: args.display_name,
             account_proxy,
             redirect_url,
@@ -458,13 +461,12 @@ pub(crate) async fn oauth_callback(
         }
     };
     let identity =
-        match fetch_userinfo(&pending.provider, &tokens.access_token, &pending.network).await {
+        match fetch_mailbox_identity(&pending.provider, &tokens.access_token, &pending.network)
+            .await
+        {
             Ok(identity) => identity,
-            Err(_error) if pending.provider == "gmail" => {
-                (pending.email.clone(), pending.display_name.clone())
-            }
             Err(error) => {
-                return callback_page_flow_error(&state, state_key, error).await;
+                return callback_page_flow_error(&state, state_key, error.to_string()).await;
             }
         };
 
@@ -490,19 +492,26 @@ async fn persist_oauth_account(
     state: &AppStateRef,
     pending: &PendingOAuth,
     tokens: &TokenPair,
-    identity: (String, String),
+    identity: pebble_core::OAuthMailboxIdentity,
 ) -> Result<Account, String> {
     let provider = pending.provider.clone();
-    let email = if identity.0.trim().is_empty() {
-        pending.email.clone()
+    let email = identity.email.clone();
+    let display_name = if provider == "gmail" && !pending.display_name.trim().is_empty() {
+        pending.display_name.trim().to_owned()
     } else {
-        identity.0
+        identity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| pending.display_name.clone())
     };
-    let display_name = if identity.1.trim().is_empty() {
-        pending.display_name.clone()
-    } else {
-        identity.1
-    };
+    pebble_mail::sender::sender_mailbox(&pebble_core::EmailAddress {
+        name: Some(display_name.clone()),
+        address: email.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+    let account_label =
+        pebble_store::accounts::normalize_account_label(pending.account_label.as_deref())
+            .map_err(|error| error.to_string())?;
     let account_proxy = pending.account_proxy.clone();
     let oauth_tokens = OAuthTokens {
         access_token: tokens.access_token.clone(),
@@ -518,6 +527,8 @@ async fn persist_oauth_account(
         let now = now_timestamp();
         let color = Some(default_account_color(&accounts, &email));
         let account = Account {
+            account_label,
+            provider_display_name: identity.display_name.clone(),
             id: new_id(),
             email,
             display_name,
@@ -528,6 +539,7 @@ async fn persist_oauth_account(
         };
         store.insert_account(&account)?;
         let result = (|| -> Result<(), PebbleError> {
+            store.apply_verified_oauth_identity(&account.id, &account.email, &identity, false)?;
             let stored = crate::commands::oauth::StoredOAuthAuthData::from_tokens(
                 oauth_tokens,
                 account_proxy,
@@ -560,52 +572,100 @@ fn non_empty_json_string<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-async fn fetch_userinfo(
+fn parse_userinfo(
+    provider: &str,
+    response: &serde_json::Value,
+) -> Result<(String, String), PebbleError> {
+    let provider = provider.to_lowercase();
+    let email = match provider.as_str() {
+        "gmail" => non_empty_json_string(response, "email"),
+        "outlook" => non_empty_json_string(response, "mail")
+            .or_else(|| non_empty_json_string(response, "userPrincipalName")),
+        _ => return Err(PebbleError::UnsupportedProvider(provider)),
+    }
+    .ok_or_else(|| {
+        PebbleError::OAuth(format!(
+            "{provider} user profile did not include a mailbox address"
+        ))
+    })?;
+
+    let name = match provider.as_str() {
+        "outlook" => non_empty_json_string(response, "displayName")
+            .or_else(|| non_empty_json_string(response, "name")),
+        _ => non_empty_json_string(response, "name")
+            .or_else(|| non_empty_json_string(response, "displayName")),
+    }
+    .unwrap_or_default();
+
+    Ok((email.to_string(), name.to_string()))
+}
+
+fn parse_mailbox_identity(
+    provider: &str,
+    profile: &serde_json::Value,
+) -> Result<pebble_core::OAuthMailboxIdentity, PebbleError> {
+    let subject = non_empty_json_string(profile, "id").ok_or_else(|| {
+        PebbleError::Validation("The provider did not return a stable mailbox identity".into())
+    })?;
+    // A UPN may be an external login. It is not sufficient for sending or repairing a mailbox.
+    let (email_field, _name_field) = match provider {
+        "outlook" => ("mail", "displayName"),
+        "gmail" => ("email", "name"),
+        _ => return Err(PebbleError::UnsupportedProvider(provider.into())),
+    };
+    let email = non_empty_json_string(profile, email_field).ok_or_else(|| {
+        PebbleError::Validation("The provider could not confirm the actual mailbox address. The saved account was not changed.".into())
+    })?;
+    if provider == "gmail"
+        && profile
+            .get("verified_email")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        return Err(PebbleError::Validation(
+            "The mailbox address is not verified".into(),
+        ));
+    }
+    let (_, parsed_name) = parse_userinfo(provider, profile)?;
+    let identity = pebble_core::OAuthMailboxIdentity {
+        subject: format!("{provider}:{subject}"),
+        email: email.to_owned(),
+        display_name: (!parsed_name.is_empty()).then_some(parsed_name),
+    };
+    pebble_mail::sender::sender_mailbox(&pebble_core::EmailAddress {
+        name: identity.display_name.clone(),
+        address: identity.email.clone(),
+    })?;
+    Ok(identity)
+}
+
+pub(crate) async fn fetch_mailbox_identity(
     provider: &str,
     access_token: &str,
     network: &OAuthNetworkConfig,
-) -> Result<(String, String), String> {
-    let url = match provider {
-        "gmail" => oauth_provider_url(
-            "gmail",
-            "userinfo",
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-        ),
-        "outlook" => oauth_provider_url(
-            "outlook",
-            "userinfo",
-            "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName",
-        ),
-        _ => return Err(format!("unsupported OAuth provider: {provider}")),
+) -> Result<pebble_core::OAuthMailboxIdentity, PebbleError> {
+    let default_url = match provider {
+        "gmail" => "https://www.googleapis.com/oauth2/v2/userinfo",
+        "outlook" => {
+            "https://graph.microsoft.com/v1.0/me?$select=id,mail,userPrincipalName,displayName"
+        }
+        _ => return Err(PebbleError::UnsupportedProvider(provider.into())),
     };
-    let client =
-        build_http_client(network).map_err(|e| format!("Userinfo HTTP client failed: {e}"))?;
-    let value: Value = client
-        .get(&url)
+    let url = oauth_provider_url(provider, "userinfo", default_url);
+    let client = build_http_client(network)
+        .map_err(|e| PebbleError::Network(format!("Mailbox verification failed: {e}")))?;
+    let profile: Value = client
+        .get(url)
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|e| format!("Userinfo request failed: {e}"))?
+        .map_err(|e| PebbleError::Network(format!("Mailbox verification failed: {e}")))?
         .error_for_status()
-        .map_err(|e| format!("Userinfo request failed: {e}"))?
+        .map_err(|e| PebbleError::Network(format!("Mailbox verification failed: {e}")))?
         .json()
         .await
-        .map_err(|e| format!("Userinfo parse failed: {e}"))?;
-    let email = match provider {
-        "gmail" => non_empty_json_string(&value, "email"),
-        "outlook" => non_empty_json_string(&value, "mail")
-            .or_else(|| non_empty_json_string(&value, "userPrincipalName")),
-        _ => None,
-    }
-    .ok_or_else(|| format!("{provider} user profile did not include a mailbox address"))?;
-    let name = match provider {
-        "outlook" => non_empty_json_string(&value, "displayName")
-            .or_else(|| non_empty_json_string(&value, "name")),
-        _ => non_empty_json_string(&value, "name")
-            .or_else(|| non_empty_json_string(&value, "displayName")),
-    }
-    .unwrap_or_default();
-    Ok((email.to_string(), name.to_string()))
+        .map_err(|e| PebbleError::Network(format!("Mailbox profile was invalid: {e}")))?;
+    parse_mailbox_identity(provider, &profile)
 }
 
 fn normalize_provider(provider: &str) -> Result<String, String> {
@@ -928,7 +988,7 @@ mod tests {
             state_key.clone(),
             PendingOAuth {
                 provider: "gmail".to_string(),
-                email: "oauth@example.test".to_string(),
+                account_label: None,
                 display_name: "OAuth Test".to_string(),
                 account_proxy: None,
                 redirect_url: redirect_url.to_string(),

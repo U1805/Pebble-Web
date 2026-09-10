@@ -157,7 +157,7 @@ cargo check --locked -p pebble-web --all-targets
 cargo test --locked -p pebble-web --all-targets
 cargo build --locked -p pebble-web
 pnpm test
-pnpm exec tsc --noEmit
+pnpm exec tsc --noEmit -p src-web/tsconfig.json
 pnpm exec vite build --config src-web/vite.config.ts
 ```
 
@@ -173,7 +173,7 @@ pnpm build
 
 桌面构建需要当前平台的 Tauri 系统依赖；其他平台打包由对应环境验证。根 `pnpm build:frontend` 使用桌面 Vite 配置，不能代替显式 Web 构建。
 
-根 `tsconfig.json` 当前只 include `src/`，`tsc --noEmit` 不覆盖所有 Web TS 文件。修改 Web shim/runtime 时需确保受影响代码有有效的类型检查；Vite 转译成功不是完整 Web 类型检查证据。
+根 `tsconfig.json` 只 include `src/`；Web 使用 `src-web/tsconfig.json` 同时检查共享前端及 Web shim、runtime、补丁和构建配置。Docker 构建使用同一配置；Vite 转译成功不能代替类型检查。
 
 Web Rust 测试位于模块内，已有 Web 前端补丁测试也位于 `src-web/patch/`。静态 command 名称检查只能发现接口名称缺口，重要变化还需验证 runtime、SQLite、远端调用次数和失败恢复；没有受控账户时不能把模拟测试称为真实收发验证。
 

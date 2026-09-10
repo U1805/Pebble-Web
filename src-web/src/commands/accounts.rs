@@ -15,6 +15,8 @@ use crate::state::AppStateRef;
 /// 与桌面端 src-tauri/src/commands/accounts.rs 的 AddAccountRequest 字节级对齐。
 #[derive(Deserialize)]
 pub struct AddAccountRequest {
+    #[serde(default)]
+    pub account_label: Option<String>,
     pub email: String,
     pub display_name: String,
     pub provider: String,
@@ -350,6 +352,10 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
     let request: AddAccountRequest =
         serde_json::from_value(args.get("request").cloned().unwrap_or(Value::Null))
             .map_err(|e| ApiError::BadRequest(format!("invalid add_account args: {e}")))?;
+    pebble_mail::sender::sender_mailbox(&pebble_core::EmailAddress {
+        name: Some(request.display_name.clone()),
+        address: request.email.clone(),
+    })?;
     let provider = match request.provider.to_lowercase().as_str() {
         "imap" => ProviderType::Imap,
         "pop3" => ProviderType::Pop3,
@@ -383,6 +389,10 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
     let now = now_timestamp();
     let existing_accounts = state.store.list_accounts().map_err(ApiError::from_store)?;
     let account = Account {
+        account_label: pebble_store::accounts::normalize_account_label(
+            request.account_label.as_deref(),
+        )?,
+        provider_display_name: None,
         id: new_id(),
         email: request.email.clone(),
         display_name: request.display_name.clone(),
@@ -465,6 +475,8 @@ pub async fn add_account(state: AppStateRef, args: Value) -> Result<Value, ApiEr
 /// 凭据相关字段任一变更即触发合并改写 auth_data；仅元数据变更则直接更新行。
 #[derive(Deserialize)]
 pub struct UpdateAccountRequest {
+    #[serde(default)]
+    pub account_label: Option<String>,
     pub account_id: String,
     pub email: String,
     pub display_name: String,
@@ -497,6 +509,11 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
         .map_err(|e| ApiError::BadRequest(format!("invalid update_account args: {e}")))?;
 
     validate_account_color(req.account_color.as_deref())?;
+    pebble_mail::sender::sender_mailbox(&pebble_core::EmailAddress {
+        name: Some(req.display_name.clone()),
+        address: req.email.clone(),
+    })?;
+    pebble_store::accounts::normalize_account_label(req.account_label.as_deref())?;
 
     let credentials_dirty = req.password.is_some()
         || req.imap_host.is_some()
@@ -512,11 +529,12 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
     if !credentials_dirty {
         state
             .store
-            .update_account(
+            .update_account_details(
                 &req.account_id,
                 &req.email,
                 &req.display_name,
                 req.account_color.as_deref(),
+                req.account_label.as_deref(),
             )
             .map_err(ApiError::from_store)?;
         return Ok(Value::Null);
@@ -635,11 +653,12 @@ pub async fn update_account(state: AppStateRef, args: Value) -> Result<Value, Ap
 
     state
         .store
-        .update_account(
+        .update_account_details(
             &req.account_id,
             &req.email,
             &req.display_name,
             req.account_color.as_deref(),
+            req.account_label.as_deref(),
         )
         .map_err(ApiError::from_store)?;
 

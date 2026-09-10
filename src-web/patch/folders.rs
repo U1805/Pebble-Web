@@ -1,6 +1,20 @@
 use pebble_core::{Folder, FolderRole, PebbleError};
 use pebble_store::Store;
 
+/// Local drafts and outgoing mail must remain accessible before the first
+/// successful provider sync. Upstream hides every local folder at this point.
+pub(crate) fn local_mail_folders_before_sync(folders: Vec<Folder>) -> Vec<Folder> {
+    folders
+        .into_iter()
+        .filter(|folder| {
+            matches!(
+                folder.remote_id.as_str(),
+                "__local_drafts__" | "__local_outbox__" | "__local_sent__"
+            )
+        })
+        .collect()
+}
+
 /// Prefer a provider-backed system folder over its local fallback.
 ///
 /// Upstream keeps `__local_*` folders when a remote folder later appears.

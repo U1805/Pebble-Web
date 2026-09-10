@@ -1,4 +1,5 @@
-use pebble_core::traits::{MailProvider, OutgoingMessage};
+use crate::commands::oauth::ensure_account_oauth_auth;
+use pebble_core::traits::{MailTransport, OutgoingMessage};
 use pebble_core::{
     new_id, now_timestamp, Account, EmailAddress, Folder, FolderRole, FolderType, Message,
     PebbleError, ProviderType,
@@ -6,7 +7,6 @@ use pebble_core::{
 use pebble_mail::smtp::SmtpSender;
 use pebble_mail::{GmailProvider, OutlookProvider, SmtpConfig};
 use serde_json::Value;
-use std::sync::Arc;
 
 use crate::commands::accounts::StoredMailConfig;
 use crate::commands::attachments::{
@@ -111,14 +111,7 @@ pub(crate) fn load_smtp_config(state: &AppState, account_id: &str) -> Result<Smt
 fn prepare_outgoing_send_locally(
     state: &AppStateRef,
     account: &Account,
-    to: Vec<EmailAddress>,
-    cc: Vec<EmailAddress>,
-    bcc: Vec<EmailAddress>,
-    subject: &str,
-    body_text: &str,
-    body_html: Option<String>,
-    in_reply_to: Option<String>,
-    attachment_paths: &[String],
+    outgoing: &OutgoingMessage,
 ) -> Result<PreparedOutgoingSend, PebbleError> {
     let outbox =
         ensure_local_outgoing_folder(&state.store, &account.id, LocalOutgoingState::Queued)?;
@@ -140,7 +133,7 @@ fn prepare_outgoing_send_locally(
     let now = now_timestamp();
     let id = new_id();
     let attachment_paths =
-        validate_staged_attachment_paths(&state.attachments_dir, attachment_paths)?;
+        validate_staged_attachment_paths(&state.attachments_dir, &outgoing.attachment_paths)?;
     let attachment_records =
         stage_local_attachment_records(&state.attachments_dir, &id, &attachment_paths)?;
     let mut message = Message {
@@ -148,18 +141,18 @@ fn prepare_outgoing_send_locally(
         account_id: account.id.clone(),
         remote_id: format!("local-outbox-{id}"),
         message_id_header: Some(format!("<{id}@pebble.local>")),
-        in_reply_to: in_reply_to.clone(),
-        references_header: in_reply_to,
+        in_reply_to: outgoing.in_reply_to.clone(),
+        references_header: outgoing.in_reply_to.clone(),
         thread_id: None,
-        subject: subject.to_string(),
-        snippet: body_text.chars().take(200).collect(),
-        from_address: account.email.clone(),
-        from_name: account.display_name.clone(),
-        to_list: to,
-        cc_list: cc,
-        bcc_list: bcc,
-        body_text: body_text.to_string(),
-        body_html_raw: body_html.unwrap_or_default(),
+        subject: outgoing.subject.clone(),
+        snippet: outgoing.body_text.chars().take(200).collect(),
+        from_address: outgoing.from.address.clone(),
+        from_name: outgoing.from.name.clone().unwrap_or_default(),
+        to_list: outgoing.to.clone(),
+        cc_list: outgoing.cc.clone(),
+        bcc_list: outgoing.bcc.clone(),
+        body_text: outgoing.body_text.clone(),
+        body_html_raw: outgoing.body_html.clone().unwrap_or_default(),
         has_attachments: !attachment_records.is_empty(),
         is_read: true,
         is_starred: false,
@@ -251,6 +244,10 @@ pub(crate) fn outgoing_message_from_stored(
     attachment_paths: Vec<String>,
 ) -> OutgoingMessage {
     OutgoingMessage {
+        from: EmailAddress {
+            name: (!message.from_name.is_empty()).then(|| message.from_name.clone()),
+            address: message.from_address.clone(),
+        },
         to: message.to_list.clone(),
         cc: message.cc_list.clone(),
         bcc: message.bcc_list.clone(),
@@ -266,21 +263,10 @@ pub(crate) fn outgoing_message_from_stored(
     }
 }
 
-pub(crate) async fn send_imap_smtp_message(
-    state: &AppState,
-    account: &Account,
+async fn send_smtp_message(
+    sender: &SmtpSender,
     outgoing: &OutgoingMessage,
 ) -> Result<(), PebbleError> {
-    let smtp_config = load_smtp_config(state, &account.id)?;
-    let sender = SmtpSender::new(
-        smtp_config.host,
-        smtp_config.port,
-        smtp_config.username,
-        smtp_config.password,
-        smtp_config.security,
-        smtp_config.accept_invalid_certs,
-        smtp_config.proxy,
-    );
     let to = outgoing
         .to
         .iter()
@@ -298,7 +284,7 @@ pub(crate) async fn send_imap_smtp_message(
         .collect::<Vec<_>>();
     sender
         .send(
-            &account.email,
+            &outgoing.from,
             &to,
             &cc,
             &bcc,
@@ -311,26 +297,88 @@ pub(crate) async fn send_imap_smtp_message(
         .await
 }
 
-/// Send an OAuth message through the shared Gmail/Outlook provider.  The
-/// provider implementations already own the wire format and attachment
-/// handling; Web only supplies the decrypted access token and local paths.
-async fn send_oauth_message(
-    provider: &Arc<dyn MailProvider>,
-    message: &Message,
-    attachment_paths: &[String],
-) -> Result<(), PebbleError> {
-    provider
-        .send_message(&OutgoingMessage {
-            to: message.to_list.clone(),
-            cc: message.cc_list.clone(),
-            bcc: message.bcc_list.clone(),
-            subject: message.subject.clone(),
-            body_text: message.body_text.clone(),
-            body_html: (!message.body_html_raw.is_empty()).then_some(message.body_html_raw.clone()),
-            in_reply_to: message.in_reply_to.clone(),
-            attachment_paths: attachment_paths.to_vec(),
-        })
-        .await
+pub(crate) enum PreparedSendTransport {
+    Gmail(GmailProvider),
+    Outlook(OutlookProvider),
+    Smtp(SmtpSender),
+}
+
+impl PreparedSendTransport {
+    pub(crate) async fn send(
+        &self,
+        outgoing: &OutgoingMessage,
+    ) -> std::result::Result<(), PebbleError> {
+        match self {
+            Self::Gmail(provider) => provider.send_message(outgoing).await,
+            Self::Outlook(provider) => provider.send_message(outgoing).await,
+            Self::Smtp(sender) => send_smtp_message(sender, outgoing).await,
+        }
+    }
+}
+
+pub(crate) async fn prepare_send_transport(
+    state: &AppState,
+    account: &Account,
+) -> std::result::Result<(PreparedSendTransport, EmailAddress), PebbleError> {
+    let mut from = account.sender_identity();
+    pebble_mail::sender::sender_mailbox(&from)?;
+    match account.provider {
+        ProviderType::Gmail => {
+            let auth = ensure_account_oauth_auth(state, &account.id, "gmail").await?;
+            let identity = super::oauth::fetch_mailbox_identity("gmail", &auth).await?;
+            state.store.apply_verified_oauth_identity(
+                &account.id,
+                &account.email,
+                &identity,
+                false,
+            )?;
+            from.address = identity.email;
+            Ok((
+                PreparedSendTransport::Gmail(GmailProvider::new_with_proxy(
+                    auth.tokens.access_token,
+                    auth.proxy,
+                )?),
+                from,
+            ))
+        }
+        ProviderType::Outlook => {
+            let auth = ensure_account_oauth_auth(state, &account.id, "outlook").await?;
+            let identity = super::oauth::fetch_mailbox_identity("outlook", &auth).await?;
+            state.store.apply_verified_oauth_identity(
+                &account.id,
+                &account.email,
+                &identity,
+                false,
+            )?;
+            from = EmailAddress {
+                name: identity.display_name,
+                address: identity.email,
+            };
+            Ok((
+                PreparedSendTransport::Outlook(OutlookProvider::new_with_proxy(
+                    auth.tokens.access_token,
+                    account.id.clone(),
+                    auth.proxy,
+                )?),
+                from,
+            ))
+        }
+        ProviderType::Imap | ProviderType::Pop3 => {
+            let smtp_config = load_smtp_config(state, &account.id)?;
+            Ok((
+                PreparedSendTransport::Smtp(SmtpSender::new(
+                    smtp_config.host,
+                    smtp_config.port,
+                    smtp_config.username,
+                    smtp_config.password,
+                    smtp_config.security,
+                    smtp_config.accept_invalid_certs,
+                    smtp_config.proxy,
+                )),
+                from,
+            ))
+        }
+    }
 }
 
 /// 同步外发消息到搜索索引（与桌面端 refresh_search_document 等价）。
@@ -367,7 +415,7 @@ fn pending_ops_changed_event() -> String {
     .to_string()
 }
 
-/// 发送邮件（P0：IMAP/POP3 账户走 SMTP；Gmail/Outlook OAuth 后续批次）。
+/// 发送邮件：验证发件身份后复用共享 SMTP/Gmail/Outlook transport。
 /// 暂存附件先复制到本地外发记录，再由 SMTP 发送；pending op 状态机与桌面端一致。
 pub async fn send_email(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
@@ -401,68 +449,24 @@ pub async fn send_email(state: AppStateRef, args: Value) -> Result<Value, ApiErr
     // in-progress send. A token refresh or provider-construction failure is a
     // known pre-dispatch failure and must never be recorded as an
     // outcome-unknown send.
-    let (smtp_config, oauth_provider) = match account.provider {
-        ProviderType::Imap | ProviderType::Pop3 => (
-            Some(load_smtp_config(&state, &account.id).map_err(ApiError::from_pebble)?),
-            None,
-        ),
-        ProviderType::Gmail => {
-            let auth = crate::commands::oauth::ensure_account_oauth_auth(
-                &state,
-                &account.id,
-                "gmail",
-            )
-            .await
-            .map_err(ApiError::from_pebble)?;
-            (
-                None,
-                Some(Arc::new(
-                    GmailProvider::new_with_proxy(auth.tokens.access_token, auth.proxy)
-                        .map_err(ApiError::from_pebble)?,
-                ) as Arc<dyn MailProvider>),
-            )
-        }
-        ProviderType::Outlook => {
-            let auth = crate::commands::oauth::ensure_account_oauth_auth(
-                &state,
-                &account.id,
-                "outlook",
-            )
-            .await
-            .map_err(ApiError::from_pebble)?;
-            (
-                None,
-                Some(Arc::new(
-                    OutlookProvider::new_with_proxy(
-                        auth.tokens.access_token,
-                        account.id.clone(),
-                        auth.proxy,
-                    )
-                    .map_err(ApiError::from_pebble)?,
-                ) as Arc<dyn MailProvider>),
-            )
-        }
+    let (transport, from) = prepare_send_transport(&state, &account).await?;
+    let outgoing = OutgoingMessage {
+        from,
+        to: parse_recipients(args.to),
+        cc: parse_recipients(args.cc),
+        bcc: parse_recipients(args.bcc),
+        subject: args.subject,
+        body_text: args.body_text,
+        body_html: args.body_html,
+        in_reply_to: args.in_reply_to,
+        attachment_paths: args.attachment_paths.unwrap_or_default(),
     };
-    let to = parse_recipients(args.to);
-    let cc = parse_recipients(args.cc);
-    let bcc = parse_recipients(args.bcc);
 
     let prepared = {
         let state_for_prepare = state.clone();
         let account_for_prepare = account.clone();
         run_blocking(move || {
-            prepare_outgoing_send_locally(
-                &state_for_prepare,
-                &account_for_prepare,
-                to,
-                cc,
-                bcc,
-                &args.subject,
-                &args.body_text,
-                args.body_html,
-                args.in_reply_to,
-                &args.attachment_paths.clone().unwrap_or_default(),
-            )
+            prepare_outgoing_send_locally(&state_for_prepare, &account_for_prepare, &outgoing)
         })
         .await?
     };
@@ -471,55 +475,9 @@ pub async fn send_email(state: AppStateRef, args: Value) -> Result<Value, ApiErr
         .iter()
         .filter_map(|attachment| attachment.local_path.clone())
         .collect();
-    let send_result = if let Some(smtp_config) = smtp_config {
-        let sender = SmtpSender::new(
-            smtp_config.host,
-            smtp_config.port,
-            smtp_config.username,
-            smtp_config.password,
-            smtp_config.security,
-            smtp_config.accept_invalid_certs,
-            smtp_config.proxy,
-        );
-        let to_addrs: Vec<String> = prepared
-            .message
-            .to_list
-            .iter()
-            .map(|a| a.address.clone())
-            .collect();
-        let cc_addrs: Vec<String> = prepared
-            .message
-            .cc_list
-            .iter()
-            .map(|a| a.address.clone())
-            .collect();
-        let bcc_addrs: Vec<String> = prepared
-            .message
-            .bcc_list
-            .iter()
-            .map(|a| a.address.clone())
-            .collect();
-        sender
-            .send(
-                &account.email,
-                &to_addrs,
-                &cc_addrs,
-                &bcc_addrs,
-                &prepared.message.subject,
-                &prepared.message.body_text,
-                (!prepared.message.body_html_raw.is_empty())
-                    .then_some(prepared.message.body_html_raw.as_str()),
-                prepared.message.in_reply_to.as_deref(),
-                &durable_attachment_paths,
-            )
-            .await
-    } else if let Some(provider) = oauth_provider.as_ref() {
-        send_oauth_message(provider, &prepared.message, &durable_attachment_paths).await
-    } else {
-        return Err(ApiError::Internal(
-            "send transport was not prepared for account provider".to_string(),
-        ));
-    };
+    let durable_outgoing =
+        outgoing_message_from_stored(&prepared.message, durable_attachment_paths);
+    let send_result = transport.send(&durable_outgoing).await;
 
     match send_result {
         Ok(()) => {

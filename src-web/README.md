@@ -13,7 +13,7 @@
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm exec tsc --noEmit
+pnpm exec tsc --noEmit -p src-web/tsconfig.json
 pnpm exec vite build --config src-web/vite.config.ts
 cargo build --locked -p pebble-web
 ```
@@ -51,6 +51,7 @@ src-web/
 ├── src/               # Axum 服务、命令适配和后台任务
 ├── frontend/          # Web 入口、Tauri shim 和浏览器 runtime
 ├── patch/             # 经确认的上游问题兼容补丁
+├── tsconfig.json      # 包含 Web runtime、shim 和补丁的类型检查
 ├── vite.config.ts     # Web 入口与模块 alias
 ├── Dockerfile
 └── docker-compose.yaml

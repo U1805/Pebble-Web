@@ -501,3 +501,92 @@ async fn update_oauth_account_proxy_setting_value(
     })
     .await
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OAuthIdentityPreview {
+    pub account_id: String,
+    pub previous_email: String,
+    pub identity: pebble_core::OAuthMailboxIdentity,
+}
+
+async fn inspect_oauth_identity(
+    state: &AppState,
+    account_id: &str,
+    expected: Option<&OAuthIdentityPreview>,
+) -> Result<OAuthIdentityPreview, PebbleError> {
+    ensure_oauth_account_provider(state, account_id)?;
+    let account = state
+        .store
+        .get_account(account_id)?
+        .ok_or_else(|| PebbleError::Validation("Account not found".into()))?;
+    // Refresh before taking the lock: ensure_account_oauth_auth acquires this same lock.
+    ensure_account_oauth_auth(state, account_id, provider_slug(&account.provider)).await?;
+    let lock = oauth_account_lock(&state.oauth_account_locks, account_id).await;
+    let _guard = lock.lock().await;
+    let account = state
+        .store
+        .get_account(account_id)?
+        .ok_or_else(|| PebbleError::Validation("Account not found".into()))?;
+    let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, account_id)?
+        .ok_or_else(|| PebbleError::Auth("Account authorization is missing".into()))?;
+    let auth = ResolvedOAuthAuth {
+        tokens: stored.tokens(),
+        proxy: effective_oauth_proxy(&state.crypto, &state.store, &stored)?,
+    };
+    let identity = fetch_mailbox_identity(provider_slug(&account.provider), &auth).await?;
+    if let Some(expected) = expected {
+        if expected.account_id != account_id
+            || expected.previous_email != account.email
+            || expected.identity.subject != identity.subject
+            || expected.identity.email != identity.email
+        {
+            return Err(PebbleError::Validation(
+                "Mailbox details changed since the preview. Verify the mailbox again.".into(),
+            ));
+        }
+        state
+            .store
+            .apply_verified_oauth_identity(account_id, &account.email, &identity, true)?;
+    }
+    Ok(OAuthIdentityPreview {
+        account_id: account_id.into(),
+        previous_email: account.email,
+        identity,
+    })
+}
+
+pub async fn preview_oauth_identity(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    let args: AccountProxyArgs = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid preview_oauth_identity args: {e}")))?;
+    let preview = inspect_oauth_identity(&state, &args.account_id, None).await?;
+    serde_json::to_value(preview).map_err(ApiError::from_serialize)
+}
+
+pub async fn apply_oauth_identity(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct Args {
+        preview: OAuthIdentityPreview,
+    }
+    let args: Args = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("invalid apply_oauth_identity args: {e}")))?;
+    inspect_oauth_identity(&state, &args.preview.account_id, Some(&args.preview)).await?;
+    let account = state
+        .store
+        .get_account(&args.preview.account_id)?
+        .ok_or_else(|| PebbleError::Validation("Account not found".into()))?;
+    serde_json::to_value(account).map_err(ApiError::from_serialize)
+}
+
+pub(crate) async fn fetch_mailbox_identity(
+    provider: &str,
+    auth: &ResolvedOAuthAuth,
+) -> Result<pebble_core::OAuthMailboxIdentity, PebbleError> {
+    crate::oauth::fetch_mailbox_identity(
+        provider,
+        &auth.tokens.access_token,
+        &OAuthNetworkConfig {
+            proxy: auth.proxy.clone(),
+        },
+    )
+    .await
+}

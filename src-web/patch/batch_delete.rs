@@ -257,6 +257,8 @@ mod tests {
         let now = now_timestamp();
         store
             .insert_account(&Account {
+                account_label: None,
+                provider_display_name: None,
                 id: "account-1".to_string(),
                 email: "alice@example.test".to_string(),
                 display_name: "Alice".to_string(),

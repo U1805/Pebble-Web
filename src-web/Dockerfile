@@ -10,7 +10,7 @@ COPY package.json pnpm-lock.yaml ./
 RUN bun install --frozen-lockfile --ignore-scripts
 
 COPY . .
-RUN bun x tsc --noEmit \
+RUN bun x tsc --noEmit -p src-web/tsconfig.json \
     && bun x vite build --config src-web/vite.config.ts
 
 FROM rust:${RUST_VERSION}-bookworm AS backend

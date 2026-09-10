@@ -20,6 +20,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "update_account_proxy",
     "update_account_proxy_setting",
     "complete_oauth_flow",
+    "preview_oauth_identity",
+    "apply_oauth_identity",
     "import_background_image",
     "delete_background_image",
     "export_backup_file",
@@ -178,6 +180,8 @@ async fn dispatch(state: AppStateRef, command: &str, args: Value) -> Result<Json
         "update_account_proxy_setting" => Ok(Json(
             accounts::update_account_proxy_setting(state.clone(), args).await?,
         )),
+        "preview_oauth_identity" => Ok(Json(oauth::preview_oauth_identity(state, args).await?)),
+        "apply_oauth_identity" => Ok(Json(oauth::apply_oauth_identity(state, args).await?)),
         // Web OAuth is a two-step browser flow: this command creates the
         // server-side PKCE transaction and returns the authorization URL;
         // the callback completes it and posts the account to the opener.

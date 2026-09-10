@@ -55,7 +55,7 @@ function waitForOAuthPopup(popup: Window, oauthState: string): Promise<unknown> 
   return new Promise((resolve, reject) => {
     let settled = false;
     let timeoutId = 0;
-    let resultPoll: ReturnType<typeof setInterval> | null = null;
+    let resultPoll: number | null = null;
     let closeCheckInFlight = false;
 
     const cleanup = () => {

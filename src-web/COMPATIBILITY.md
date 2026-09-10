@@ -19,6 +19,8 @@
 - `src-web/src` 只保留调用这些补丁的最小接入点，避免以后同步上游时把 Web 修复误认为业务语义分叉。
 - 若补丁与上游公开 issue 的行为和根因明确对应，文件名使用 `issueNNN_` 前缀（issue ID 不足三位时前置补 `0`，例如 `issue026_`）；仅症状相似但根因不同的补丁不关联 issue 编号。
 
+本次按上游 v0.1.5（`e43341c`）逐项复核，以下 9 项补丁仍需保留：上游发件身份与 Outlook delta 的修复未解决本地目录归属、外发线程、删除语义或 IMAP MOVE UID 问题；Sidebar 的空账户循环、两种 locale 中缺少的自动备份文案，以及 Gmail 授权缺少离线访问参数也仍可复现。
+
 当前补丁如下。
 
 | 补丁 | 上游行为 | Web 修复 |
@@ -27,7 +29,7 @@
 | `outgoing.rs` | 本地 Outbox/Sent 邮件以空 `thread_id` 写入，导致已发送目录在会话视图中为空，回复也不能加入原会话 | 写入外发占位记录前按共享线程规则计算 `thread_id` |
 | `archive.rs` | IMAP 没有远端 Archive 时仍移动到 `__local_archive__`，服务器 INBOX 原件随后会被同步为第二条活动记录 | 拒绝没有服务器 Archive 目标的 IMAP 单封和批量归档，避免静默制造重复邮件 |
 | `batch_delete.rs` | 批量删除在远端移入 Trash 后仍统一软删除本地记录，pending 重放也会把已经位于 Trash 的普通删除误作本地软删除；离线永久删除还可能提前清除本地记录 | 操作前保存源目录语义，普通删除及重放均幂等移动到 Trash 并保持可见，只有原本位于 Trash 且远端确认成功的邮件才硬删除 |
-| `folders.rs` | 本地占位系统目录不会在同角色远端目录出现后移除，无序角色查询可能继续命中 `__local_*`，导致远端写回被错误降级或拒绝 | Web 解析系统目录时优先 provider-backed 目录，仅在没有远端目录时使用本地回退 |
+| `folders.rs` | 首次远端同步前隐藏所有本地目录，导致本地草稿和外发记录无法从页面访问；同角色远端目录出现后，无序角色查询又可能继续命中 `__local_*`，导致远端写回被错误降级或拒绝 | 首次同步前保留本地 Drafts/Outbox/Sent；解析系统目录时优先 provider-backed 目录，仅在没有远端目录时使用本地回退 |
 | `issue026_imap_move.rs` | [issue #26](https://github.com/QingJ01/Pebble/issues/26) 暴露了 MOVE 后远端身份改变、本地仍保留旧 `remote_id` 的问题；上游修复覆盖 Outlook，但 IMAP MOVE 后仍继续保留源邮箱 UID，目标邮箱分配新 UID 后，下次同步会把同一邮件导入为第二条活动记录 | 将同一远端身份更新原则扩展到 IMAP：移动前后核对目标邮箱，按 `Message-ID` 或唯一新增 UID 更新本地 `remote_id`；若并发同步已写入权威目标记录并造成身份冲突，则隐藏失效源记录 |
 | `issue051_cloud_sync_locales.ts` | 上游为 [issue #51](https://github.com/QingJ01/Pebble/issues/51) 增加自动 WebDAV 备份后，界面使用了未写入中英文 locale 的文案键，中文界面显示英文 fallback | 在 Web i18n 入口合并缺失的自动备份配置、校验和结果文案 |
 | `sidebar_empty_accounts.ts` | 多账户场景中，两个账户都尚无文件夹时 Sidebar 会在账户间反复自动切换，最终触发 React 最大更新深度错误 | Web 构建时把空文件夹回退收敛到稳定的“全部邮箱”，并在上游代码变化时要求重新审查补丁 |
@@ -307,7 +309,7 @@ src-web/src/commands/diagnostics.rs
 
 本节只记录已经通过 Tauri/Web 对照确认的桌面功能缺口。
 
-当前审计继续进行。
+当前没有已确认但尚未实现的缺口。
 
 若本节为空，不代表永远不存在缺口。
 

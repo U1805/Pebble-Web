@@ -44,7 +44,7 @@ fn filter_display_folders(provider: Option<&ProviderType>, folders: Vec<Folder>)
 }
 
 /// 列出账户文件夹。与桌面端行为一致：首次 OAuth 后文件夹尚未同步时返回
-/// 空列表（让侧栏保留占位文件夹）；缺本地 Archive 时补建。
+/// 空列表（让侧栏保留占位文件夹），但保留 Web 本地草稿/外发目录；缺本地 Archive 时补建。
 pub async fn list_folders(state: AppStateRef, args: Value) -> Result<Value, ApiError> {
     #[derive(serde::Deserialize)]
     struct Args {
@@ -60,7 +60,7 @@ pub async fn list_folders(state: AppStateRef, args: Value) -> Result<Value, ApiE
         let folders = store.list_folders(&account_id)?;
 
         if !provider_folders_have_arrived(&folders) {
-            return Ok(Vec::new());
+            return Ok(crate::patch::folders::local_mail_folders_before_sync(folders));
         }
 
         if should_seed_local_archive(&folders) {
