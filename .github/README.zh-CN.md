@@ -15,7 +15,7 @@
   ·
   <a href="https://github.com/QingJ01/Pebble-Web">官方 Pebble Web</a>
   ·
-  <a href="../src-web/README.md">Web 对齐说明</a>
+  <a href="../src-web/README.md">Web 文档</a>
   ·
   <a href="../LICENSE">AGPL-3.0</a>
 </p>
@@ -57,7 +57,7 @@
 
 浏览器中不存在的桌面概念不会伪装成业务成功，例如系统托盘、开机启动、原生窗口控制和设置系统默认邮件客户端。
 
-更精确的桌面/Web 差异及实现见 [`src-web/README.md`](../src-web/README.md)。
+更精确的桌面/Web 差异及实现见[兼容性台账](../src-web/COMPATIBILITY.md)。架构边界、上游同步和验证方法见[开发与维护指南](../src-web/DEVELOPMENT.md)。
 
 ## 部署
 

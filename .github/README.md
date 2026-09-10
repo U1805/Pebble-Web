@@ -15,7 +15,7 @@
   ·
   <a href="https://github.com/QingJ01/Pebble-Web">Official Pebble Web</a>
   ·
-  <a href="../src-web/README.md">Web Alignment Notes</a>
+  <a href="../src-web/README.md">Web Documentation</a>
   ·
   <a href="../LICENSE">AGPL-3.0</a>
 </p>
@@ -57,7 +57,7 @@ The current Web adaptation covers the primary personal email workflows, includin
 
 Desktop concepts that do not exist in browsers—such as the system tray, launch at startup, native window controls, and setting the operating system's default email client—are not presented as successful business operations.
 
-For a more precise description of desktop/Web differences and their implementations, see [`src-web/README.md`](../src-web/README.md).
+For desktop/Web differences and their implementations, see the [compatibility notes](../src-web/COMPATIBILITY.md). For architecture boundaries, upstream synchronization, and validation, see the [development guide](../src-web/DEVELOPMENT.md).
 
 ## Deployment
 
